@@ -94,17 +94,8 @@ def _lookup(node_id: int):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _label(node) -> str:
-    """Human-readable label for a node — shown in the graph and activity log."""
-    if isinstance(node, Timeline):    return "Timeline"
-    if isinstance(node, DecadeNode):  return f"{node.get('decade', '')}s"
-    if isinstance(node, YearNode):    return str(node.get("year", ""))
-    if isinstance(node, MonthNode):
-        m = node.get("month_name", ""); y = node.get("year", "")
-        return f"{m} {y}" if y else m
-    if isinstance(node, WeekNode):    return node.get("label", node.get("date", ""))
-    if isinstance(node, ArtistNode):  return node.get("name", "")
-    if isinstance(node, ReleaseNode): return node.get("title", "")
-    return type(node).__name__
+    """Human-readable label for a node — delegated to the node's own label property."""
+    return getattr(node, "label", type(node).__name__)
 
 
 def _node_type(node) -> str:

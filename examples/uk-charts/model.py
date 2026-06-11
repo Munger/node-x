@@ -381,9 +381,16 @@ class ChartNode(GraphBehavior, RenderMixin, PhysicsMixin, GraphMixin, Serialisab
     ## @brief Base for every serialisable, graph-registered chart node.
     ##
     ## Combines the full mixin stack so subclasses declare only what makes
-    ## them distinct.  ``Timeline`` is not a ``ChartNode`` because it carries
-    ## no ``GraphMixin`` registry and is not serialised independently.
-    pass
+    ## them distinct.
+
+    @property
+    def label(self) -> str:
+        ## @brief Human-readable display label for this node.
+        ##
+        ## Subclasses override this to derive the label from their payload.
+        ## The default falls back to the class name so unknown subclasses
+        ## still produce a legible string in the UI.
+        return type(self).__name__
 
 
 class TemporalChartNode(TemporalMixin, ChartNode):
@@ -429,6 +436,10 @@ class DecadeNode(TemporalChartNode):
     _children: ClassVar[tuple] = ("years",)
     _restore_via_payload = True
     node_colour   = "#cc7a00"
+
+    @property
+    def label(self) -> str:
+        return f"{self.get('decade', '')}s"
     node_radius   = 10
     target_radius = 220
     link_strength = 0.8
@@ -455,6 +466,10 @@ class YearNode(TemporalChartNode):
     _children: ClassVar[tuple] = ("months",)
     _restore_via_payload = True
     node_colour   = "#e05a00"
+
+    @property
+    def label(self) -> str:
+        return str(self.get("year", ""))
     node_radius   = 8
     target_radius = 160
     link_strength = 0.8
@@ -488,6 +503,12 @@ class MonthNode(TemporalChartNode):
     _children: ClassVar[tuple] = ("weeks",)
     _restore_via_payload = True
     node_colour   = "#c0392b"
+
+    @property
+    def label(self) -> str:
+        m = self.get("month_name", "")
+        y = self.get("year", "")
+        return f"{m} {y}" if y else m
     node_radius   = 6
     target_radius = 120
     link_strength = 0.8
@@ -514,7 +535,6 @@ class MonthNode(TemporalChartNode):
                 node = WeekNode.get_or_create(f"{slug}/{d.isoformat()}", {
                     "date":       d.isoformat(),
                     "chart_slug": slug,
-                    "label":      f"New Entries {d.strftime('%d %b %Y')}",
                 })
                 weeks.append(node)
                 yield node
@@ -526,6 +546,14 @@ class WeekNode(TemporalChartNode):
     """One weekly chart. Fetches entries downward; parents() links up to its MonthNode."""
     _children: ClassVar[tuple] = ("releases",)
     _restore_via_payload = True
+
+    @property
+    def label(self) -> str:
+        d = self.get("date", "")
+        try:
+            return f"New Entries {date.fromisoformat(d).strftime('%d %b %Y')}"
+        except (ValueError, TypeError):
+            return d
     node_colour   = "#3949ab"
     node_radius   = 5
     target_radius = 80
@@ -586,6 +614,10 @@ class ArtistNode(ChartNode):
     """An artist. Fetches discography, streams ReleaseNodes for the active chart type."""
     _children: ClassVar[tuple] = ("releases",)
     _restore_via_payload = True
+
+    @property
+    def label(self) -> str:
+        return self.get("name", "")
     node_colour   = "#2e7d32"
     node_radius   = 7       ## @brief Slightly larger than releases — artists are the anchor of the cluster.
     target_radius = 50
@@ -672,6 +704,10 @@ class ReleaseNode(ChartNode):
     """A charting release. Wires itself into the time spine on first discovery; streams its artist."""
     _children: ClassVar[tuple] = ("artist_node", "chart_weeks")
     _restore_via_payload = True
+
+    @property
+    def label(self) -> str:
+        return self.get("title", "")
     node_colour   = "#1a237e"
     node_radius   = 5
     target_radius = 70
