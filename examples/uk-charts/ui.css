@@ -209,6 +209,8 @@ svg { width: 100%; height: 100%; }
 }
 
 .act-s-fetching { color: #1565c0; }
+.act-s-Fetched  { color: #1565c0; }
+.act-s-Loaded   { color: #388e3c; }
 .act-s-done     { color: #388e3c; }
 .act-s-error    { color: #c62828; }
 

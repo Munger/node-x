@@ -20,8 +20,8 @@ from node_x import Node, NodeList, Serialisable, GraphMixin, NodeTransaction, Re
 Two optional companion modules extend the core with zero additional friction:
 
 ```python
-import node_x_yaml    # YAML serialisation — pip install node-x[yaml]
-import node_x_sqlite  # SQLite persistence — pip install node-x[sqlite]
+import node_x.node_x_yaml                          # YAML serialisation — pip install node-x[yaml]
+from node_x.node_x_sqlite import NodeDB, DBMixin   # SQLite persistence — pip install node-x[sqlite]
 ```
 
 ---
@@ -64,9 +64,11 @@ For SQLite persistence:
 pip install node-x[sqlite]
 ```
 
-Or drop `node_x.py` (and any companion modules you need) directly into your
-project — the core has no dependencies beyond the Python standard library,
-and `node_x_sqlite` uses only `sqlite3` which is also stdlib.
+Or copy `node_x/node_x.py` (and any companion modules you need from the same
+directory) directly into your project — the core has no dependencies beyond
+the Python standard library, and `node_x_sqlite` uses only `sqlite3` which
+is also stdlib. In standalone mode the files are imported by their filename:
+`import node_x`, `import node_x_sqlite`, `import node_x_yaml`.
 
 ---
 
@@ -530,7 +532,7 @@ PersonNode.clear_registry()
 `pip install node-x[yaml]`) that serialises node trees to YAML and back.
 
 ```python
-import node_x_yaml
+import node_x.node_x_yaml as node_x_yaml
 
 # Serialise
 text = node_x_yaml.dump(timeline)
@@ -564,7 +566,7 @@ SQLite database. It uses `sqlite3` from the standard library — no extra
 packages are required.
 
 ```python
-from node_x_sqlite import NodeDB, DBMixin
+from node_x.node_x_sqlite import NodeDB, DBMixin
 ```
 
 ### NodeDB
@@ -609,7 +611,7 @@ explicitly so nodes remain decoupled from any specific file path.
 
 ```python
 from node_x import Node, GraphMixin, Serialisable, StreamMixin
-from node_x_sqlite import NodeDB, DBMixin
+from node_x.node_x_sqlite import NodeDB, DBMixin
 
 class PersonNode(DBMixin, GraphMixin, Serialisable, StreamMixin, Node):
     _restore_via_payload = True

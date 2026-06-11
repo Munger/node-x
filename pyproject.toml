@@ -29,7 +29,7 @@ classifiers = [
 Homepage = "https://github.com/Munger/node-x"
 
 [tool.setuptools]
-py-modules = ["node_x", "node_x_yaml", "node_x_sqlite"]
+packages = ["node_x"]
 
 [project.optional-dependencies]
 yaml   = ["pyyaml>=6.0"]

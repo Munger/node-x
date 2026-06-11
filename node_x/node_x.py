@@ -1398,12 +1398,13 @@ class Serialisable:
         for field, (list_cls, item_cls) in getattr(
             cls, "_list_fields", {}
         ).items():
-            items = snapshot.get(field, [])
-            setattr(
-                node,
-                field,
-                list_cls.restore(items, item_type=item_cls, _registry=_registry),
-            )
+            items = snapshot.get(field)
+            if items is not None:
+                setattr(
+                    node,
+                    field,
+                    list_cls.restore(items, item_type=item_cls, _registry=_registry),
+                )
 
     def clone(self) -> Any:
         ## @brief Deep-clone this node and its subtree.

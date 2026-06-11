@@ -45,7 +45,7 @@ from node_x import (
     Serialisable,
     SerialisableNodeList,
 )
-import node_x_yaml
+import node_x.node_x_yaml as node_x_yaml
 
 from _helpers import (
     check,

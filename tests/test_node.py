@@ -49,7 +49,7 @@ for _d in (_PKG_DIR, _ROOT_DIR):
 import re
 
 import node_x
-import node_x_yaml
+import node_x.node_x_yaml as node_x_yaml
 from node_x import Node, NodeList
 
 from _helpers import (

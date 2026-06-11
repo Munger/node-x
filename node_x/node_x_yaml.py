@@ -40,7 +40,10 @@ from typing import Any, Optional, Dict, Type, TypeVar
 # node_x_yaml ships as part of the same package as node_x and shares its
 # version.  Importing here means there is still only one version string in
 # the entire codebase: the one in pyproject.toml.
-from node_x import __version__ as __version__  # noqa: F401
+try:
+    from . import __version__  # noqa: F401  # package mode
+except ImportError:
+    from node_x import __version__  # noqa: F401  # standalone mode
 
 # Defer the PyYAML import so that the rest of node_x is unaffected when this
 # file is never imported.  Only callers who actually use this module pay the

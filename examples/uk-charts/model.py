@@ -1,3 +1,29 @@
+## @file model.py
+##
+## @brief Node graph model for the UK Charts Explorer.
+##
+## Structure
+## ---------
+## The graph has two distinct structural zones:
+##
+##   Tree spine (Timeline → Decade → Year → Month → Week)
+##     Each node has exactly one parent.  No shared references, no cycles.
+##     GraphMixin is inherited for get_or_create convenience, but $ref
+##     serialisation never fires here.
+##
+##   Graph (Week → Release ↔ Artist)
+##     WeekNodes are referenced from both their MonthNode and from
+##     ReleaseNode.chart_weeks.  ReleaseNodes are referenced from both
+##     WeekNodes and ArtistNodes.  This is where graph identity matters
+##     and $ref serialisation keeps snapshots correct.
+##
+## All node classes inherit ChartNode, which wires together the full
+## node-x mixin stack (DBMixin, GraphMixin, Serialisable, StreamMixin
+## and the app-level RenderMixin, PhysicsMixin, GraphBehavior).
+##
+## @copyright Copyright (c) 2026 Tim Hosking
+## @par Licence: MIT
+
 from __future__ import annotations
 
 import math
@@ -21,6 +47,7 @@ for _p in (
         sys.path.insert(0, str(_p))
 
 from node_x import GraphMixin, Node, Serialisable, SerialisableNodeList, StreamMixin
+from node_x.node_x_sqlite import DBMixin
 
 # Module-level NodeDB instance.  None means no caching — behaviour is
 # identical to pre-cache code.  Set via set_node_db() at startup.
@@ -33,8 +60,10 @@ def set_node_db(db) -> None:
     _db = db
 
 
-BASE_URL          = "https://www.officialcharts.com"
-_HEADERS          = {"User-Agent": "uk-charts-explorer/1.0"}
+def _log(symbol: str, label: str, key: str) -> None:
+    print(f"  {symbol} {label:<12} {key}", flush=True)
+
+
 _FIRST_CHART_YEAR = 1952
 
 _chart_slugs: list[str] = ["albums-chart"]
@@ -51,41 +80,6 @@ def _medium(path: str) -> str:
     return "album" if path.startswith("/albums/") else "single"
 
 
-# ---------------------------------------------------------------------------
-# HTTP
-# ---------------------------------------------------------------------------
-
-_pool      = threading.Semaphore(4)
-_rate_lock = threading.Lock()
-_last_req  = 0.0
-_MIN_GAP   = 1.5
-
-
-def _fetch(path: str) -> str:
-    global _last_req
-    url = BASE_URL + path
-    req = urllib.request.Request(url, headers=_HEADERS)
-    with _pool:
-        with _rate_lock:
-            gap = _MIN_GAP - (time.monotonic() - _last_req)
-            if gap > 0:
-                time.sleep(gap)
-            _last_req = time.monotonic()
-        for attempt in range(4):
-            try:
-                with urllib.request.urlopen(req, timeout=20) as r:
-                    return r.read().decode("utf-8", errors="replace")
-            except urllib.error.HTTPError as exc:
-                if exc.code == 429 and attempt < 3:
-                    time.sleep(2 + 2 ** attempt)
-                    continue
-                raise
-
-
-def _fetch_raw(url: str) -> str:
-    req = urllib.request.Request(url, headers=_HEADERS)
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return r.read().decode("utf-8", errors="replace")
 
 
 def _related_artists(name: str) -> list[dict]:
@@ -93,7 +87,7 @@ def _related_artists(name: str) -> list[dict]:
         return []
     try:
         import json as _json
-        data    = _json.loads(_fetch_raw(_SUGGEST_BASE + urllib.parse.quote_plus(name)))
+        data    = _json.loads(ChartNode._fetch_raw(ChartNode._SUGGEST_BASE + urllib.parse.quote_plus(name)))
         artists = data.get("results", {}).get("artist", [])
         out = []
         for a in artists[:6]:
@@ -114,10 +108,12 @@ def _first_chart_date_of_month(year: int, month: int, slug: str) -> "date | None
     the response tells us the nearest actual publication date for that era.
     """
     d = date(year, month, 1)
-    while d.weekday() != 6:          # advance to first Sunday
+    while d.weekday() != 6:
         d += timedelta(days=1)
     try:
-        html   = _fetch(f"/charts/{slug}/{d.strftime('%Y%m%d')}/")
+        html   = ChartNode._fetch(f"/charts/{slug}/{d.strftime('%Y%m%d')}/")
+        # The site redirects to the nearest real publication date; read it from
+        # the canonical link rather than trusting the URL we requested.
         can_m  = _CANONICAL_RE.search(html)
         if not can_m:
             return None
@@ -126,7 +122,9 @@ def _first_chart_date_of_month(year: int, month: int, slug: str) -> "date | None
             return None
         s      = dat_m.group(1)
         chart_d = date(int(s[:4]), int(s[4:6]), int(s[6:]))
-        if chart_d.month != month:   # landed in the previous month
+        # Early-era charts sometimes snap back to the last week of the previous
+        # month; nudge forward one week to stay in the requested month.
+        if chart_d.month != month:
             chart_d += timedelta(weeks=1)
         return chart_d if chart_d.month == month else None
     except Exception:
@@ -147,7 +145,6 @@ _SPAN_RE   = re.compile(r'<span>([^<]+)</span>')
 _LW_RE         = re.compile(r'LW:\s*(?:<[^>]+>)*(\w+)')
 _CANONICAL_RE   = re.compile(r'<link[^>]+rel="canonical"[^>]+href="([^"]+)"')
 _CANONICAL_DATE = re.compile(r'/charts/[^/]+/(\d{8})/')
-_SUGGEST_BASE   = "https://backstage.officialcharts.com/ajax/search-suggestions?terms="
 _COLLAB_RE      = re.compile(r'\s+(?:FT\.?|FEAT\.?|FEATURING|AND|WITH|VS\.?|X|&)\s+', re.IGNORECASE)
 _RUN_RE    = re.compile(
     r'href="/charts/([^/]+)/(\d{8})/[^"]*"[^>]*>.*?<span[^>]*>(\d+)</span>',
@@ -207,7 +204,7 @@ def _chart_runs(entries: list[dict]) -> list[dict]:
     prev   = date.fromisoformat(entries[0]["date"])
     for e in entries[1:]:
         d = date.fromisoformat(e["date"])
-        if (d - prev).days <= 8:
+        if (d - prev).days <= 8:  # 8 not 7 — occasional mid-week holiday shifts
             length += 1
         else:
             runs.append({"date": start["date"], "run_length": length, "chart_slug": start["chart_slug"]})
@@ -236,7 +233,7 @@ def make_path_from(date_str: str, slug: str) -> "WeekNode":
         weeks = WeekList()
         month_node["weeks"] = weeks
     if wk not in weeks:
-        weeks.append(wk)
+        weeks.append(wk)  # release may chart in a week MonthNode hasn't streamed yet
     return wk
 
 
@@ -377,11 +374,75 @@ class TemporalMixin:
 # Composite base classes
 # ---------------------------------------------------------------------------
 
-class ChartNode(GraphBehavior, RenderMixin, PhysicsMixin, GraphMixin, Serialisable, StreamMixin, Node):
+class ChartNode(DBMixin, GraphBehavior, RenderMixin, PhysicsMixin, GraphMixin, Serialisable, StreamMixin, Node):
     ## @brief Base for every serialisable, graph-registered chart node.
     ##
     ## Combines the full mixin stack so subclasses declare only what makes
     ## them distinct.
+
+    # ── Network ───────────────────────────────────────────────────────────────
+    BASE_URL     = "https://www.officialcharts.com"
+    _SUGGEST_BASE = "https://backstage.officialcharts.com/ajax/search-suggestions?terms="
+    _HEADERS     = {"User-Agent": "uk-charts-explorer/1.0"}
+    _MIN_GAP     = 1.5
+    _pool        = threading.Semaphore(4)
+    _rate_lock   = threading.Lock()
+    _last_req    = 0.0
+
+    # ── Status strings ────────────────────────────────────────────────────────
+    _status_cached  = "Loaded"
+    _status_fetched = "Fetched"
+
+    @classmethod
+    def get_or_create(cls, key, data=None):
+        # Check _registry via __dict__ (not inheritance) so each concrete class
+        # gets its own registry; a miss on the subclass doesn't fall through to
+        # a parent class registry that holds a different node type.
+        if _db is not None and ("_registry" not in cls.__dict__ or key not in cls._registry):
+            hit = cls.db_load(key, _db)
+            if hit is not None:
+                if "_registry" not in cls.__dict__:
+                    cls._registry = {}
+                cls._registry[key] = hit
+                return hit
+        node = super().get_or_create(key, data)
+        # Save a stub so any node is findable in DB before its stream() is called.
+        # Guard on the primary children field prevents redundant saves once populated.
+        children = getattr(cls, "_children", ())
+        if _db is not None and (not children or node.get(children[0]) is None):
+            node._db_save()
+        return node
+
+    def _db_save(self) -> None:
+        """Persist this node to the DB if caching is enabled."""
+        if _db is not None:
+            self.db_save(_db)
+
+    @classmethod
+    def _fetch(cls, path: str) -> str:
+        url = cls.BASE_URL + path
+        req = urllib.request.Request(url, headers=cls._HEADERS)
+        with cls._pool:
+            with cls._rate_lock:
+                gap = cls._MIN_GAP - (time.monotonic() - cls._last_req)
+                if gap > 0:
+                    time.sleep(gap)
+                ChartNode._last_req = time.monotonic()
+            for attempt in range(4):
+                try:
+                    with urllib.request.urlopen(req, timeout=20) as r:
+                        return r.read().decode("utf-8", errors="replace")
+                except urllib.error.HTTPError as exc:
+                    if exc.code == 429 and attempt < 3:
+                        time.sleep(2 + 2 ** attempt)
+                        continue
+                    raise
+
+    @classmethod
+    def _fetch_raw(cls, url: str) -> str:
+        req = urllib.request.Request(url, headers=cls._HEADERS)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.read().decode("utf-8", errors="replace")
 
     @property
     def label(self) -> str:
@@ -392,6 +453,45 @@ class ChartNode(GraphBehavior, RenderMixin, PhysicsMixin, GraphMixin, Serialisab
         ## still produce a legible string in the UI.
         return type(self).__name__
 
+    def node_extra(self) -> dict:
+        ## @brief Type-specific fields to include in the JSON sent to the browser.
+        ##
+        ## Subclasses return a dict of any additional payload keys the client
+        ## needs beyond the common fields emitted by ``_node_info()``.  The base
+        ## implementation returns an empty dict; only override where extra fields
+        ## are needed.
+        return {}
+
+    def stream(self, _data=None):
+        field = self._children[0] if self._children else None
+        if not field:
+            return
+        cached = self.get(field)
+        if cached is not None:
+            self["status"] = self._status_cached
+            _log("●", type(self).__name__, self.get("_key", ""))
+            yield from cached
+            return
+        list_cls = self._list_fields[field][0]
+        children = list_cls()
+        self["status"] = "fetching"
+        _log("↓", type(self).__name__, self.get("_key", ""))
+        try:
+            for child in self.populate_self():
+                children.append(child)
+                yield child
+            self[field] = children
+            self["status"] = self._status_fetched
+            self._db_save()
+        except Exception as exc:
+            self["status"] = "error"
+            self["error"]  = str(exc)
+
+    def populate_self(self):
+        # Subclasses override this to yield their children.
+        # stream() wraps it with cache check, status, logging, save, and error handling.
+        return iter([])
+
 
 class TemporalChartNode(TemporalMixin, ChartNode):
     ## @brief Base for nodes that live on the time spine (decade → week).
@@ -400,10 +500,6 @@ class TemporalChartNode(TemporalMixin, ChartNode):
     ## root-first without knowing which level a node occupies.
     pass
 
-
-# ---------------------------------------------------------------------------
-# Time spine  (no HTTP)
-# ---------------------------------------------------------------------------
 
 class Timeline(ChartNode):
     """Single root node. Streams DecadeNodes newest-first. The natural snapshot root for the whole graph."""
@@ -415,20 +511,12 @@ class Timeline(ChartNode):
     child_spread  = 100
     charge        = -60     ## @brief Strong repulsion keeps decades from stacking on the root.
 
-    def stream(self, _data=None) -> Iterator["DecadeNode"]:
-        cached = self.get("decades")
-        if cached is not None:
-            yield from cached
-            return
-        today   = date.today()
-        decades = DecadeList()
-        end     = (today.year // 10) * 10
-        start   = (_FIRST_CHART_YEAR // 10) * 10
+    def populate_self(self):
+        today = date.today()
+        end   = (today.year // 10) * 10
+        start = (_FIRST_CHART_YEAR // 10) * 10
         for d in range(end, start - 10, -10):
-            node = DecadeNode.get_or_create(str(d), {"decade": d})
-            decades.append(node)
-            yield node
-        self["decades"] = decades
+            yield DecadeNode.get_or_create(str(d), {"decade": d})
 
 
 class DecadeNode(TemporalChartNode):
@@ -440,25 +528,21 @@ class DecadeNode(TemporalChartNode):
     @property
     def label(self) -> str:
         return f"{self.get('decade', '')}s"
+
+    def node_extra(self) -> dict:
+        return {"decade": self.get("decade", 0)}
+
     node_radius   = 10
     target_radius = 220
     link_strength = 0.8
     child_spread  = 80
     charge        = -40
 
-    def stream(self, _data=None) -> Iterator["YearNode"]:
-        cached = self.get("years")
-        if cached is not None:
-            yield from cached
-            return
+    def populate_self(self):
         decade = self["decade"]
         today  = date.today()
-        years  = YearList()
         for y in range(min(decade + 9, today.year), max(decade, _FIRST_CHART_YEAR) - 1, -1):
-            node = YearNode.get_or_create(str(y), {"year": y})
-            years.append(node)
-            yield node
-        self["years"] = years
+            yield YearNode.get_or_create(str(y), {"year": y})
 
 
 class YearNode(TemporalChartNode):
@@ -470,6 +554,10 @@ class YearNode(TemporalChartNode):
     @property
     def label(self) -> str:
         return str(self.get("year", ""))
+
+    def node_extra(self) -> dict:
+        return {"year": self.get("year", 0)}
+
     node_radius   = 8
     target_radius = 160
     link_strength = 0.8
@@ -480,22 +568,14 @@ class YearNode(TemporalChartNode):
         decade = (self["year"] // 10) * 10
         yield DecadeNode.get_or_create(str(decade), {"decade": decade})
 
-    def stream(self, _data=None) -> Iterator[Node]:
-        year   = self["year"]
-        cached = self.get("months")
-        if cached is not None:
-            yield from cached
-            return
+    def populate_self(self):
+        year       = self["year"]
         today      = date.today()
-        months     = MonthList()
         last_month = today.month if today.year == year else 12
         for m in range(1, last_month + 1):
-            node = MonthNode.get_or_create(f"{year}-{m:02d}", {
+            yield MonthNode.get_or_create(f"{year}-{m:02d}", {
                 "year": year, "month": m, "month_name": MONTH_NAMES[m - 1]
             })
-            months.append(node)
-            yield node
-        self["months"] = months
 
 
 class MonthNode(TemporalChartNode):
@@ -509,6 +589,10 @@ class MonthNode(TemporalChartNode):
         m = self.get("month_name", "")
         y = self.get("year", "")
         return f"{m} {y}" if y else m
+
+    def node_extra(self) -> dict:
+        return {"year": self.get("year", 0), "month": self.get("month", 0)}
+
     node_radius   = 6
     target_radius = 120
     link_strength = 0.8
@@ -518,28 +602,20 @@ class MonthNode(TemporalChartNode):
     def parents(self) -> Iterator["YearNode"]:
         yield YearNode.get_or_create(str(self["year"]), {"year": self["year"]})
 
-    def stream(self, _data=None) -> Iterator[Node]:
+    def populate_self(self):
         year  = self["year"]
         month = self["month"]
-        cached = self.get("weeks")
-        if cached is not None:
-            yield from cached
-            return
         today = date.today()
-        weeks = WeekList()
         for slug in _chart_slugs:
             d = _first_chart_date_of_month(year, month, slug)
             if d is None:
                 continue
             while d.month == month and d <= today:
-                node = WeekNode.get_or_create(f"{slug}/{d.isoformat()}", {
+                yield WeekNode.get_or_create(f"{slug}/{d.isoformat()}", {
                     "date":       d.isoformat(),
                     "chart_slug": slug,
                 })
-                weeks.append(node)
-                yield node
                 d += timedelta(weeks=1)
-        self["weeks"] = weeks
 
 
 class WeekNode(TemporalChartNode):
@@ -554,6 +630,10 @@ class WeekNode(TemporalChartNode):
             return f"New Entries {date.fromisoformat(d).strftime('%d %b %Y')}"
         except (ValueError, TypeError):
             return d
+
+    def node_extra(self) -> dict:
+        return {"date": self.get("date", ""), "chart_slug": self.get("chart_slug", "")}
+
     node_colour   = "#3949ab"
     node_radius   = 5
     target_radius = 80
@@ -568,46 +648,21 @@ class WeekNode(TemporalChartNode):
             "month_name": MONTH_NAMES[d_obj.month - 1],
         })
 
-    def stream(self, _data=None) -> Iterator[Node]:
-        # Warm from DB before the in-memory check so a server restart
-        # re-uses previously fetched data without hitting the OCC website.
-        if _db is not None and self.get("releases") is None:
-            _wk_key = self.get("_key", "")
-            if _wk_key:
-                _cached_wk = _db.load(WeekNode, _wk_key)
-                if _cached_wk is not None:
-                    self["releases"] = _cached_wk.get("releases")
-        cached = self.get("releases")
-        if cached is not None:
-            yield from cached
-            return
+    def populate_self(self):
         dt   = self["date"].replace("-", "")
         slug = self["chart_slug"]
-        path = f"/charts/{slug}/{dt}/"
-        self["status"] = "fetching"
-        try:
-            releases = ReleaseList()
-            for e in _parse_week_html(_fetch(path)):
-                song_path = e.get("song_path", "")
-                node = ReleaseNode.get_or_create(song_path, {
-                    "title":       e.get("title", ""),
-                    "artist":      e.get("artist", ""),
-                    "position":    e.get("position", 0),
-                    "song_path":   song_path,
-                    "artist_path": e.get("artist_path", ""),
-                    "chart_date":  self["date"],
-                    "chart_slug":  slug,
-                    "medium":      _medium(song_path),
-                })
-                releases.append(node)
-                yield node
-            self["releases"] = releases
-            self["status"]   = "done"
-            if _db is not None:
-                _db.save(self)
-        except Exception as exc:
-            self["status"] = "error"
-            self["error"]  = str(exc)
+        for e in _parse_week_html(self._fetch(f"/charts/{slug}/{dt}/")):
+            song_path = e.get("song_path", "")
+            yield ReleaseNode.get_or_create(song_path, {
+                "title":       e.get("title", ""),
+                "artist":      e.get("artist", ""),
+                "position":    e.get("position", 0),
+                "song_path":   song_path,
+                "artist_path": e.get("artist_path", ""),
+                "chart_date":  self["date"],
+                "chart_slug":  slug,
+                "medium":      _medium(song_path),
+            })
 
 
 class ArtistNode(ChartNode):
@@ -618,6 +673,10 @@ class ArtistNode(ChartNode):
     @property
     def label(self) -> str:
         return self.get("name", "")
+
+    def node_extra(self) -> dict:
+        return {"artist_path": self.get("artist_path", "")}
+
     node_colour   = "#2e7d32"
     node_radius   = 7       ## @brief Slightly larger than releases — artists are the anchor of the cluster.
     target_radius = 50
@@ -625,79 +684,57 @@ class ArtistNode(ChartNode):
     child_spread  = 300     ## @brief Large scatter so releases don't spawn on top of each other.
     charge        = -20
 
-    def stream(self, _data=None) -> Iterator["ReleaseNode"]:
-        # Warm from DB on cache miss so a server restart avoids refetching.
-        if _db is not None and self.get("releases") is None:
-            _ak = self.get("_key", "")
-            if _ak:
-                _cached_a = _db.load(ArtistNode, _ak)
-                if _cached_a is not None:
-                    self["releases"] = _cached_a.get("releases")
-                    if _cached_a.get("is_known"):
-                        self.mark_known()
-        cached = self.get("releases")
-        if cached is not None:
-            yield from cached
+    def stream(self, _data=None):
+        if self.get("name", "").lower() == "various artists" or not self.get("artist_path"):
             return
-        if self.get("name", "").lower() == "various artists":
-            return
-        path = self.get("artist_path", "")
-        if not path:
-            return
+        # is_known prevents re-expansion of the same artist within one session
+        # (e.g. artist A → release → artist A via collaboration credit).
         if self.is_known:
             yield from self.get("releases") or []
             return
+        fresh = self.get("releases") is None  # capture before mark_known/super may set it
         self.mark_known()
-        self["status"] = "fetching"
-        try:
-            target   = set(_chart_slugs)
-            releases = ReleaseList()
-            for r in _parse_artist_html(_fetch(path)):
-                if r["chart_slug"] not in target:
-                    continue
-                if len(releases) >= 100:
-                    break
-                node = ReleaseNode.get_or_create(r["path"], {
-                    "title":       r["title"],
-                    "path":        r["path"],
-                    "chart_date":  r.get("chart_date", ""),
-                    "chart_slug":  r["chart_slug"],
-                    "artist_path": path,
-                    "medium":      _medium(r["path"]),
-                })
-                releases.append(node)
-                yield node
-            self["releases"] = releases
-            self["status"]   = "done"
-            if _db is not None and self.get("_key"):
-                _db.save(self)
-        except Exception as exc:
-            self["status"] = "error"
-            self["error"]  = str(exc)
-            return
-        own_path  = self.get("artist_path", "")
-        own_name  = self.get("name", "")
+        yield from super().stream()
+        if fresh:
+            # Related artist suggestions are ephemeral — not stored in releases,
+            # not saved to DB, only yielded on the first live fetch.
+            yield from self._yield_related()
+
+    def populate_self(self):
+        path   = self.get("artist_path", "")
+        target = set(_chart_slugs)
+        count  = 0
+        for r in _parse_artist_html(self._fetch(path)):
+            if r["chart_slug"] not in target or count >= 100:
+                continue
+            count += 1
+            yield ReleaseNode.get_or_create(r["path"], {
+                "title":       r["title"],
+                "path":        r["path"],
+                "chart_date":  r.get("chart_date", ""),
+                "chart_slug":  r["chart_slug"],
+                "artist_path": path,
+                "medium":      _medium(r["path"]),
+            })
+
+    def _yield_related(self):
+        own_path   = self.get("artist_path", "")
+        own_name   = self.get("name", "")
         seen_paths = {own_path}
 
-        def _yield_suggestions(search_name: str):
-            for r in _related_artists(search_name):
-                if r["artist_path"] in seen_paths:
-                    continue
-                seen_paths.add(r["artist_path"])
-                yield ArtistNode.get_or_create(r["artist_path"], {
-                    "name": r["name"], "artist_path": r["artist_path"],
-                })
+        def _suggestions(name):
+            for r in _related_artists(name):
+                if r["artist_path"] not in seen_paths:
+                    seen_paths.add(r["artist_path"])
+                    yield ArtistNode.get_or_create(r["artist_path"], {
+                        "name": r["name"], "artist_path": r["artist_path"],
+                    })
 
-        yield from _yield_suggestions(own_name)
-
-        # For collaboration names, also search each component individually
-        # so e.g. "STEVIE WONDER FT AISHA MORRIS" surfaces both artists.
-        parts = _COLLAB_RE.split(own_name)
-        if len(parts) > 1:
-            for part in parts:
-                part = part.strip()
-                if part:
-                    yield from _yield_suggestions(part)
+        yield from _suggestions(own_name)
+        # Split collaboration credits ("ARTIST FT OTHER") and search each part
+        # so both collaborators surface as related suggestions.
+        for part in (p.strip() for p in _COLLAB_RE.split(own_name) if p.strip()):
+            yield from _suggestions(part)
 
 
 class ReleaseNode(ChartNode):
@@ -708,6 +745,23 @@ class ReleaseNode(ChartNode):
     @property
     def label(self) -> str:
         return self.get("title", "")
+
+    def node_extra(self) -> dict:
+        return {
+            "chart_date":    self.get("chart_date",    ""),
+            "chart_slug":    self.get("chart_slug",    ""),
+            "title":         self.get("title",         ""),
+            "position":      self.get("position",       0),
+            "artist":        self.get("artist",        ""),
+            "path":          self.get("path", "") or self.get("song_path", ""),
+            "medium":        self.get("medium",        ""),
+            "peak_position": self.get("peak_position", 0),
+            "total_weeks":   self.get("total_weeks",   0),
+            "chart_from":    self.get("chart_from",   ""),
+            "chart_to":      self.get("chart_to",     ""),
+            "chart_score":   self.get("chart_score",  0.0),
+        }
+
     node_colour   = "#1a237e"
     node_radius   = 5
     target_radius = 70
@@ -719,7 +773,9 @@ class ReleaseNode(ChartNode):
         """Fetch the full chart run and populate chart_weeks. Idempotent."""
         if self.get("chart_weeks") is not None:
             return
-        # Check DB before making a network request.
+        # get_or_create checks DB on a registry miss, but a node created earlier
+        # in the same session stays in the registry as a stub.  Check DB here so
+        # a previously saved timeline is not re-fetched over the network.
         if _db is not None:
             _rk = self.get("_key") or self.get("song_path") or self.get("path", "")
             if _rk:
@@ -730,13 +786,16 @@ class ReleaseNode(ChartNode):
                         _v = _cached_r.get(_f)
                         if _v is not None:
                             self[_f] = _v
+                    self["status"] = self._status_cached
+                    _log("●", "ReleaseNode", self.get("_key", self.get("title", "")))
                     return
         release_path = self.get("song_path") or self.get("path", "")
         if not release_path:
             return
+        _log("↓", "ReleaseNode", self.get("_key", self.get("title", "")))
         self["status"] = "fetching"
         try:
-            all_entries = _parse_release_html(_fetch(release_path))
+            all_entries = _parse_release_html(self._fetch(release_path))
             # Only process entries for the active chart type(s).
             target  = set(_chart_slugs)
             entries = [e for e in all_entries if e["chart_slug"] in target]
@@ -760,14 +819,13 @@ class ReleaseNode(ChartNode):
                 self["chart_to"]      = dates[-1] if dates else ""
                 # log-weighted score: rewards high positions AND longevity
                 self["chart_score"]   = sum(math.log(102 - p) for p in positions)
-            self["status"] = "done"
-            if _db is not None and self.get("_key"):
-                _db.save(self)
+            self["status"] = self._status_fetched
+            self._db_save()
         except Exception as exc:
             self["status"] = "error"
             self["error"]  = str(exc)
 
-    def stream(self, _data=None) -> Iterator[Node]:
+    def stream(self, _data=None):
         self.fetch_timeline()
         # Artist
         if not self.get("artist_node"):

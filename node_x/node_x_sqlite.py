@@ -61,7 +61,10 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional, Type, TypeVar
 
-from node_x import __version__ as __version__  # noqa: F401 — co-versioned with node_x
+try:
+    from . import __version__  # noqa: F401  # package mode
+except ImportError:
+    from node_x import __version__  # noqa: F401  # standalone mode
 
 T = TypeVar("T")
 

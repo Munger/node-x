@@ -55,7 +55,7 @@ from node_x import (
     Serialisable,
     SerialisableNodeList,
 )
-from node_x_sqlite import DBMixin, NodeDB
+from node_x.node_x_sqlite import DBMixin, NodeDB
 
 from _helpers import (
     catch_into,
@@ -181,6 +181,29 @@ def run() -> Tuple[int, int]:
     check(passed, failed,
           [rt["entries"][i]["id"] for i in range(3)] == [0, 1, 2],
           "NodeList element fields preserved after DB round-trip")
+
+    db.close()
+
+    # ------------------------------------------------------------------
+    heading("node_x_sqlite: partial save — unpopulated _list_fields stay None")
+    # ------------------------------------------------------------------
+    # A node saved before its children are fetched must restore with those
+    # fields still absent (None), not silently initialised to empty lists.
+    # An empty list would fool a `if cached is not None` cache guard into
+    # believing the node has already been expanded.
+
+    db = NodeDB(":memory:")
+
+    stub = TreeNode({"name": "stub"})   # entries / child never set
+    db.save(stub, key="stub")
+    rs = db.load(TreeNode, "stub")
+
+    check(passed, failed, rs is not None,
+          "stub node restores from DB")
+    check(passed, failed, rs.get("entries") is None,
+          "unpopulated _list_fields entry is None after restore, not empty list")
+    check(passed, failed, rs.get("child") is None,
+          "unpopulated _node_fields entry is None after restore")
 
     db.close()
 

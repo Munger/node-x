@@ -131,32 +131,7 @@ def _node_info(node) -> dict:
         # GraphBehavior — operational flags
         "auto_expand": getattr(node, "auto_expand", False),
     }
-    if isinstance(node, DecadeNode):
-        info["decade"] = node.get("decade", 0) if g else 0
-    elif isinstance(node, YearNode):
-        info["year"]   = node.get("year", 0) if g else 0
-    elif isinstance(node, MonthNode):
-        info["year"]   = node.get("year", 0) if g else 0
-        info["month"]  = node.get("month", 0) if g else 0
-    elif isinstance(node, WeekNode):
-        info["date"]       = node.get("date", "") if g else ""
-        info["chart_slug"] = node.get("chart_slug", "") if g else ""
-    elif isinstance(node, ArtistNode):
-        info["artist_path"] = node.get("artist_path", "") if g else ""
-    elif isinstance(node, ReleaseNode):
-        info["chart_date"]    = node.get("chart_date",    "") if g else ""
-        info["chart_slug"]    = node.get("chart_slug",    "") if g else ""
-        info["title"]         = node.get("title",         "") if g else ""
-        info["position"]      = node.get("position",       0) if g else 0
-        info["artist"]        = node.get("artist",        "") if g else ""
-        info["path"]          = node.get("path", "") or node.get("song_path", "") if g else ""
-        info["medium"]        = node.get("medium",        "") if g else ""
-        # Chart stats — populated by fetch_timeline(); may be zero until then
-        info["peak_position"] = node.get("peak_position", 0)   if g else 0
-        info["total_weeks"]   = node.get("total_weeks",   0)   if g else 0
-        info["chart_from"]    = node.get("chart_from",   "")   if g else ""
-        info["chart_to"]      = node.get("chart_to",     "")   if g else ""
-        info["chart_score"]   = node.get("chart_score",  0.0)  if g else 0.0
+    info.update(node.node_extra())
     return info
 
 
@@ -657,7 +632,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(200, {"artists": []}); return
         try:
             import json as _json
-            raw  = model._fetch_raw(model._SUGGEST_BASE + urllib.parse.quote_plus(terms))
+            raw  = model.ChartNode._fetch_raw(model.ChartNode._SUGGEST_BASE + urllib.parse.quote_plus(terms))
             data = _json.loads(raw)
             out  = []
             for a in data.get("results", {}).get("artist", [])[:8]:
@@ -698,7 +673,7 @@ def main() -> None:
                     help="SQLite cache path, e.g. cache.db (default: no caching)")
     args = ap.parse_args()
     if args.db:
-        from node_x_sqlite import NodeDB
+        from node_x.node_x_sqlite import NodeDB
         model.set_node_db(NodeDB(args.db))
         print(f"Cache: {args.db}")
     _bfs.start()    # spin up worker threads before accepting the first request

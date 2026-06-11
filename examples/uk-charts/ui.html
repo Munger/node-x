@@ -444,6 +444,7 @@ let _sse = null;
 function _setupSSE() {
   if (_sse) _sse.close();
   _sse = new EventSource("/stream");
+  _sse._ready = new Promise(res => _sse.addEventListener("open", res, { once: true }));
   _sse.addEventListener("expand", e => {
     const data = JSON.parse(e.data);
     const nd   = gNodes.find(n => n.id === data.node_id);
@@ -469,7 +470,7 @@ function _setupSSE() {
     sim.force("link").links(gLinks);
     sim.alpha(Math.max(sim.alpha(), SIM.nudgeAlpha)).restart();
 
-    actLog(data.label, data.status === "error" ? "error" : "done");
+    actLog(data.label, data.status || "done");
   });
 
   _sse.addEventListener("status", e => {
@@ -756,6 +757,7 @@ async function resetGraph() {
   // Recreate the SSE connection so stale events from the old cascade are
   // discarded and can't create orphan nodes in the new graph.
   _setupSSE();
+  await _sse._ready;   // ensure server has subscribed before /root triggers any BFS events
 
   try {
     // Ask the server to reset its node graph and return the root node
