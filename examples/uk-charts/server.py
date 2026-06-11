@@ -703,7 +703,13 @@ class _Handler(BaseHTTPRequestHandler):
 def main() -> None:
     ap = argparse.ArgumentParser(description="UK Charts Explorer — Node-X demo")
     ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--db", default="", metavar="PATH",
+                    help="SQLite cache path, e.g. cache.db (default: no caching)")
     args = ap.parse_args()
+    if args.db:
+        from node_x_sqlite import NodeDB
+        model.set_node_db(NodeDB(args.db))
+        print(f"Cache: {args.db}")
     _bfs.start()    # spin up worker threads before accepting the first request
     server = ThreadingHTTPServer(("", args.port), _Handler)
     print(f"UK Charts Explorer at http://localhost:{args.port}/")

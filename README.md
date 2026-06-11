@@ -1,20 +1,27 @@
 # Node-X
 
-A composable graph object model for Python — serialisable, streamable, and
-thread-safe — with zero core dependencies.
+A composable graph object model for Python — serialisable, streamable,
+persistent, and thread-safe — with zero core dependencies.
 
 Tree libraries are common. Node-X is something else: a complete object model
-for building, transmitting, and operating on typed graphs at runtime. A node
+for building, transmitting, and persisting typed graphs at runtime. A node
 graph can be constructed, walked, mutated under concurrent access, frozen into
-an immutable snapshot, serialised to JSON or YAML, sent over any wire — REST,
-sockets, queues, whatever you have — and restored on the other end as a fully
-typed, immediately operational object graph. Restored graphs can be grafted
-onto live trees, streamed for lazy population, or frozen as trust boundaries.
-The core library ships as a single file with no dependencies beyond the Python
-standard library.
+an immutable snapshot, serialised to JSON, YAML, or SQLite, sent over any
+wire — REST, sockets, queues, whatever you have — and restored on the other
+end as a fully typed, immediately operational object graph. Restored graphs
+can be grafted onto live trees, streamed for lazy population, frozen as trust
+boundaries, or cached locally across process restarts. The core library ships
+as a single file with no dependencies beyond the Python standard library.
 
 ```python
 from node_x import Node, NodeList, Serialisable, GraphMixin, NodeTransaction, ReadWriteMixin
+```
+
+Two optional companion modules extend the core with zero additional friction:
+
+```python
+import node_x_yaml    # YAML serialisation — pip install node-x[yaml]
+import node_x_sqlite  # SQLite persistence — pip install node-x[sqlite]
 ```
 
 ---
@@ -32,6 +39,7 @@ from node_x import Node, NodeList, Serialisable, GraphMixin, NodeTransaction, Re
 - [Serialisation](#serialisation)
 - [Graph identity](#graph-identity)
 - [YAML](#yaml)
+- [SQLite persistence](#sqlite-persistence)
 - [Streaming](#streaming)
 - [Thread safety](#thread-safety)
 - [Class reference](#class-reference)
@@ -44,14 +52,21 @@ from node_x import Node, NodeList, Serialisable, GraphMixin, NodeTransaction, Re
 pip install node-x
 ```
 
-For YAML serialisation support:
+For YAML serialisation:
 
 ```
 pip install node-x[yaml]
 ```
 
-Or drop `node_x.py` directly into your project — it has no dependencies
-beyond the Python standard library.
+For SQLite persistence:
+
+```
+pip install node-x[sqlite]
+```
+
+Or drop `node_x.py` (and any companion modules you need) directly into your
+project — the core has no dependencies beyond the Python standard library,
+and `node_x_sqlite` uses only `sqlite3` which is also stdlib.
 
 ---
 
@@ -542,6 +557,119 @@ text = node_x_yaml.dump(node, default_flow_style=True)
 
 ---
 
+## SQLite persistence
+
+`node_x_sqlite` is a companion module that stores node snapshots in a local
+SQLite database. It uses `sqlite3` from the standard library — no extra
+packages are required.
+
+```python
+from node_x_sqlite import NodeDB, DBMixin
+```
+
+### NodeDB
+
+`NodeDB` is a thread-safe store keyed by `(class_name, key)`. Each calling
+thread gets its own connection; WAL journal mode allows multiple threads to
+read simultaneously.
+
+```python
+db = NodeDB("cache.db")
+
+# Save any Serialisable node
+db.save(node, key="config")        # explicit key
+db.save(graph_node)                # auto-key from node["_key"] (GraphMixin)
+
+# Restore — returns None on cache miss
+cached = db.load(PersonNode, "user-42")
+if cached is None:
+    cached = PersonNode.get_or_create("user-42", fetch_from_api("user-42"))
+    db.save(cached)
+
+# Inspect the cache
+db.keys(PersonNode)    # ['user-1', 'user-2', 'user-42', ...]
+db.count(PersonNode)   # 3
+db.count()             # total rows across all classes
+
+# Remove entries
+db.delete(PersonNode, "user-42")   # one entry
+db.clear(PersonNode)               # all entries for this class
+db.clear()                         # everything
+
+# Context manager — closes the calling thread's connection on exit
+with NodeDB("cache.db") as db:
+    db.save(node, key="config")
+```
+
+### DBMixin
+
+Mix `DBMixin` into a node class to get `db_save`, `db_load`, and `db_delete`
+without constructing the `NodeDB` path yourself. The database is always passed
+explicitly so nodes remain decoupled from any specific file path.
+
+```python
+from node_x import Node, GraphMixin, Serialisable, StreamMixin
+from node_x_sqlite import NodeDB, DBMixin
+
+class PersonNode(DBMixin, GraphMixin, Serialisable, StreamMixin, Node):
+    _restore_via_payload = True
+
+    def stream(self, _data=None):
+        # Yield children on demand
+        ...
+
+db = NodeDB("people.db")
+
+# Instance methods
+alice = PersonNode.get_or_create("user-42", {"name": "Alice"})
+alice.db_save(db)                          # saves under alice["_key"]
+alice.db_delete(db)                        # removes the entry
+
+# Class method
+alice = PersonNode.db_load("user-42", db)  # None on miss
+```
+
+### Persistence and graph identity
+
+`NodeDB` uses `node.snapshot()` for serialisation — the same format as JSON
+and YAML. Graph `$ref` markers are round-tripped correctly: a shared
+`GraphMixin` node serialised with `{"$ref": "key"}` in the snapshot restores
+as a single shared Python object, preserving graph identity exactly as a
+JSON or YAML round-trip does.
+
+```python
+alice = PersonNode.get_or_create("user-42", {"name": "Alice"})
+
+# Two documents share the same author object
+doc_a["author"] = alice
+doc_b["author"] = alice
+
+db.save(corpus, key="corpus-1")
+restored = db.load(Corpus, "corpus-1")
+
+# Graph identity is preserved across the DB round-trip
+assert restored["documents"][0]["author"] is restored["documents"][1]["author"]
+```
+
+### Cache-aside pattern
+
+The typical pattern for expensive operations (HTTP, computation) is
+check-then-populate:
+
+```python
+node = PersonNode.get_or_create("user-42")
+
+# Try the cache first; fall back to live fetch on miss
+cached = db.load(PersonNode, "user-42")
+if cached is not None:
+    node["profile"] = cached.get("profile")
+else:
+    node["profile"] = fetch_profile("user-42")
+    db.save(node)
+```
+
+---
+
 ## Streaming
 
 `StreamMixin` adds lazy child discovery to a Node. Override `stream()` to
@@ -759,6 +887,20 @@ with NodeTransaction(a, b):
 |---|---|
 | `dump(node, *, default_flow_style=False, indent=2)` | Serialise a `Serialisable` node tree to a YAML string |
 | `load(cls, text)` | Reconstruct a node tree from a YAML string via `cls.restore()` |
+
+### node_x_sqlite
+
+| Class / Method | Purpose |
+|---|---|
+| `NodeDB(path)` | Open (or create) a SQLite database for node snapshot storage |
+| `NodeDB.save(node, key=None)` | Persist a snapshot; auto-key from `node["_key"]` if present |
+| `NodeDB.load(cls, key)` | Restore a node, or return `None` on cache miss |
+| `NodeDB.delete(cls, key)` | Remove a single entry |
+| `NodeDB.clear(cls=None)` | Remove all entries for a class, or everything |
+| `NodeDB.keys(cls)` | Sorted list of stored keys for a class |
+| `NodeDB.count(cls=None)` | Row count for a class, or total |
+| `NodeDB.close()` | Close the calling thread's connection |
+| `DBMixin` | Mixin adding `db_save(db)`, `db_load(key, db)`, `db_delete(db)` to a node class |
 
 ### Payload type whitelist
 

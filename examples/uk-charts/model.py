@@ -22,6 +22,17 @@ for _p in (
 
 from node_x import GraphMixin, Node, Serialisable, SerialisableNodeList, StreamMixin
 
+# Module-level NodeDB instance.  None means no caching — behaviour is
+# identical to pre-cache code.  Set via set_node_db() at startup.
+_db = None
+
+
+def set_node_db(db) -> None:
+    """Point the model at a NodeDB instance for cache-aside reads and writes."""
+    global _db
+    _db = db
+
+
 BASE_URL          = "https://www.officialcharts.com"
 _HEADERS          = {"User-Agent": "uk-charts-explorer/1.0"}
 _FIRST_CHART_YEAR = 1952
@@ -363,6 +374,27 @@ class TemporalMixin:
 
 
 # ---------------------------------------------------------------------------
+# Composite base classes
+# ---------------------------------------------------------------------------
+
+class ChartNode(GraphBehavior, RenderMixin, PhysicsMixin, GraphMixin, Serialisable, StreamMixin, Node):
+    ## @brief Base for every serialisable, graph-registered chart node.
+    ##
+    ## Combines the full mixin stack so subclasses declare only what makes
+    ## them distinct.  ``Timeline`` is not a ``ChartNode`` because it carries
+    ## no ``GraphMixin`` registry and is not serialised independently.
+    pass
+
+
+class TemporalChartNode(TemporalMixin, ChartNode):
+    ## @brief Base for nodes that live on the time spine (decade → week).
+    ##
+    ## Adds ``TemporalMixin`` iteration so the server can walk the spine
+    ## root-first without knowing which level a node occupies.
+    pass
+
+
+# ---------------------------------------------------------------------------
 # Time spine  (no HTTP)
 # ---------------------------------------------------------------------------
 
@@ -391,7 +423,7 @@ class Timeline(GraphBehavior, RenderMixin, PhysicsMixin, StreamMixin, Node):
         self["decades"] = decades
 
 
-class DecadeNode(GraphBehavior, RenderMixin, PhysicsMixin, TemporalMixin, GraphMixin, Serialisable, StreamMixin, Node):
+class DecadeNode(TemporalChartNode):
     """A decade. Streams YearNodes. GraphMixin-keyed so it can be found from any direction."""
     _children: ClassVar[tuple] = ("years",)
     node_colour   = "#cc7a00"
@@ -416,7 +448,7 @@ class DecadeNode(GraphBehavior, RenderMixin, PhysicsMixin, TemporalMixin, GraphM
         self["years"] = years
 
 
-class YearNode(GraphBehavior, RenderMixin, PhysicsMixin, TemporalMixin, GraphMixin, Serialisable, StreamMixin, Node):
+class YearNode(TemporalChartNode):
     """A calendar year. Streams MonthNodes downward; parents() links up to its DecadeNode."""
     _children: ClassVar[tuple] = ("months",)
     node_colour   = "#e05a00"
@@ -448,7 +480,7 @@ class YearNode(GraphBehavior, RenderMixin, PhysicsMixin, TemporalMixin, GraphMix
         self["months"] = months
 
 
-class MonthNode(GraphBehavior, RenderMixin, PhysicsMixin, TemporalMixin, GraphMixin, Serialisable, StreamMixin, Node):
+class MonthNode(TemporalChartNode):
     """A calendar month. Streams WeekNodes downward; parents() links up to its YearNode."""
     _children: ClassVar[tuple] = ("weeks",)
     node_colour   = "#c0392b"
@@ -486,7 +518,7 @@ class MonthNode(GraphBehavior, RenderMixin, PhysicsMixin, TemporalMixin, GraphMi
         self["weeks"] = weeks
 
 
-class WeekNode(GraphBehavior, RenderMixin, PhysicsMixin, TemporalMixin, GraphMixin, Serialisable, StreamMixin, Node):
+class WeekNode(TemporalChartNode):
     """One weekly chart. Fetches entries downward; parents() links up to its MonthNode."""
     _children: ClassVar[tuple] = ("releases",)
     node_colour   = "#3949ab"
@@ -504,6 +536,14 @@ class WeekNode(GraphBehavior, RenderMixin, PhysicsMixin, TemporalMixin, GraphMix
         })
 
     def stream(self, _data=None) -> Iterator[Node]:
+        # Warm from DB before the in-memory check so a server restart
+        # re-uses previously fetched data without hitting the OCC website.
+        if _db is not None and self.get("releases") is None:
+            _wk_key = self.get("_key", "")
+            if _wk_key:
+                _cached_wk = _db.load(WeekNode, _wk_key)
+                if _cached_wk is not None:
+                    self["releases"] = _cached_wk.get("releases")
         cached = self.get("releases")
         if cached is not None:
             yield from cached
@@ -530,12 +570,14 @@ class WeekNode(GraphBehavior, RenderMixin, PhysicsMixin, TemporalMixin, GraphMix
                 yield node
             self["releases"] = releases
             self["status"]   = "done"
+            if _db is not None:
+                _db.save(self)
         except Exception as exc:
             self["status"] = "error"
             self["error"]  = str(exc)
 
 
-class ArtistNode(GraphBehavior, RenderMixin, PhysicsMixin, GraphMixin, Serialisable, StreamMixin, Node):
+class ArtistNode(ChartNode):
     """An artist. Fetches discography, streams ReleaseNodes for the active chart type."""
     _children: ClassVar[tuple] = ("releases",)
     node_colour   = "#2e7d32"
@@ -546,6 +588,15 @@ class ArtistNode(GraphBehavior, RenderMixin, PhysicsMixin, GraphMixin, Serialisa
     charge        = -20
 
     def stream(self, _data=None) -> Iterator["ReleaseNode"]:
+        # Warm from DB on cache miss so a server restart avoids refetching.
+        if _db is not None and self.get("releases") is None:
+            _ak = self.get("_key", "")
+            if _ak:
+                _cached_a = _db.load(ArtistNode, _ak)
+                if _cached_a is not None:
+                    self["releases"] = _cached_a.get("releases")
+                    if _cached_a.get("is_known"):
+                        self.mark_known()
         cached = self.get("releases")
         if cached is not None:
             yield from cached
@@ -580,6 +631,8 @@ class ArtistNode(GraphBehavior, RenderMixin, PhysicsMixin, GraphMixin, Serialisa
                 yield node
             self["releases"] = releases
             self["status"]   = "done"
+            if _db is not None and self.get("_key"):
+                _db.save(self)
         except Exception as exc:
             self["status"] = "error"
             self["error"]  = str(exc)
@@ -609,7 +662,7 @@ class ArtistNode(GraphBehavior, RenderMixin, PhysicsMixin, GraphMixin, Serialisa
                     yield from _yield_suggestions(part)
 
 
-class ReleaseNode(GraphBehavior, RenderMixin, PhysicsMixin, GraphMixin, Serialisable, StreamMixin, Node):
+class ReleaseNode(ChartNode):
     """A charting release. Wires itself into the time spine on first discovery; streams its artist."""
     _children: ClassVar[tuple] = ("artist_node", "chart_weeks")
     node_colour   = "#1a237e"
@@ -623,6 +676,18 @@ class ReleaseNode(GraphBehavior, RenderMixin, PhysicsMixin, GraphMixin, Serialis
         """Fetch the full chart run and populate chart_weeks. Idempotent."""
         if self.get("chart_weeks") is not None:
             return
+        # Check DB before making a network request.
+        if _db is not None:
+            _rk = self.get("_key") or self.get("song_path") or self.get("path", "")
+            if _rk:
+                _cached_r = _db.load(ReleaseNode, _rk)
+                if _cached_r is not None and _cached_r.get("chart_weeks") is not None:
+                    for _f in ("chart_weeks", "run_lengths", "peak_position",
+                               "total_weeks", "chart_from", "chart_to", "chart_score"):
+                        _v = _cached_r.get(_f)
+                        if _v is not None:
+                            self[_f] = _v
+                    return
         release_path = self.get("song_path") or self.get("path", "")
         if not release_path:
             return
@@ -653,6 +718,8 @@ class ReleaseNode(GraphBehavior, RenderMixin, PhysicsMixin, GraphMixin, Serialis
                 # log-weighted score: rewards high positions AND longevity
                 self["chart_score"]   = sum(math.log(102 - p) for p in positions)
             self["status"] = "done"
+            if _db is not None and self.get("_key"):
+                _db.save(self)
         except Exception as exc:
             self["status"] = "error"
             self["error"]  = str(exc)
