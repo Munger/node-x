@@ -1,0 +1,782 @@
+<!DOCTYPE html>
+<!--
+  UK Charts Explorer — ui.html
+
+  D3 v7 force-graph that visualises official UK chart data streamed from
+  server.py.  The server owns the BFS queue; this page just renders what
+  arrives on the SSE stream and issues POST /explore/<id> when the user
+  clicks a node.
+
+  Architecture
+  ────────────
+  • GET /root          → reset server graph, receive root node JSON
+  • POST /explore/<id> → push a node onto the server BFS queue
+  • GET /stream        → EventSource; receives expand/status/done events
+  • POST /pause|resume → suspend / continue server workers
+  • POST /stop         → drain server queue without resetting graph
+  • GET /stats/<id>    → on-hover chart stats fetch (tooltip only)
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>UK Charts Explorer</title>
+<link rel="stylesheet" href="/ui.css">
+<script src="/prefs.js"></script>
+</head>
+<body>
+
+<div id="toolbar">
+  <h1>UK CHARTS EXPLORER</h1>
+  <div class="tb-sep"></div>
+  <div id="search-wrap">
+    <input id="search-input" type="text" placeholder="Search artist…" autocomplete="off">
+    <div id="search-results"></div>
+  </div>
+  <div class="chart-toggle">
+    <button id="tog-albums"  class="active" onclick="setChart('albums')">Albums</button>
+    <button id="tog-singles"            onclick="setChart('singles')">Singles</button>
+    <button id="tog-both"               onclick="setChart('both')">Both</button>
+  </div>
+  <button id="pause-btn" class="tb-btn" onclick="togglePause()">Pause</button>
+  <button id="stop-btn"  class="tb-btn" onclick="stopCascade()">Stop</button>
+  <button id="reset-btn" class="tb-btn" onclick="resetGraph()">Reset</button>
+  <span id="status-text">Initialising…</span>
+</div>
+
+<div id="canvas">
+  <svg id="svg">
+    <g id="zoom-g">
+      <g id="link-g"></g>
+      <g id="node-g"></g>
+    </g>
+  </svg>
+
+  <div id="leg">
+    <div><span style="background:#FFD700"></span>timeline</div>
+    <div><span style="background:#CC8800"></span>decade</div>
+    <div><span style="background:#FF6D00"></span>year</div>
+    <div><span style="background:#E53935"></span>month</div>
+    <div><span style="background:#5c6bc0"></span>week</div>
+    <div><span style="background:#4CAF50"></span>artist</div>
+    <div><span style="background:#A5D6A7"></span>album</div>
+    <div><span style="background:#80DEEA"></span>single</div>
+  </div>
+
+  <div id="queue-bar"></div>
+  <div id="act"></div>
+  <div id="tip"></div>
+</div>
+
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<script>
+"use strict";
+
+// ── Colour palette ─────────────────────────────────────────────────────────
+//
+// Temporal spine uses a warm spectrum stepping down in luminosity each level.
+// Artist/release nodes use a green spectrum; artists are more prominent.
+
+// Colour and radius are carried by each node as node_colour / node_radius (from
+// RenderMixin on the server).  Prefs.get("nodeColour") provides the user-override
+// layer; the node attribute is the class default and the fallback.
+
+const colour = d => {
+  if (typeof d === "string") return Prefs.get("nodeColour", d) || "#555";
+  // Releases split by medium so albums and singles stay visually distinct.
+  if (d.node_type === "release") {
+    const key = d.medium === "single" ? "release_single" : "release_album";
+    return Prefs.get("nodeColour", key) || d.node_colour || "#555";
+  }
+  // Prefs override takes precedence; fall back to node_colour from RenderMixin.
+  return Prefs.get("nodeColour", d.node_type) || d.node_colour || "#555";
+};
+
+// Release radius scales with log-weighted chart score so long-running chart-toppers
+// appear larger.  All other types use the node_radius from RenderMixin (sent by
+// the server) so changing the mixin value takes effect on next expansion.
+const radius = d => {
+  if (typeof d === "string") return Prefs.get("nodePhysics", d)?.node_radius || 6;
+  if (d.node_type === "release" && d.chart_score > 0)
+    return Math.max(5, Math.min(22, 4 + Math.sqrt(d.chart_score) * 1.8));
+  return d.node_radius || 6;
+};
+
+// ── D3 setup ───────────────────────────────────────────────────────────────
+
+const svg      = d3.select("#svg");
+const zoomG    = d3.select("#zoom-g");
+const linkG    = d3.select("#link-g");
+const nodeG    = d3.select("#node-g");
+const tipEl    = document.getElementById("tip");
+const actEl    = document.getElementById("act");
+const qBar     = document.getElementById("queue-bar");
+const statusEl = document.getElementById("status-text");
+
+const W = () => document.getElementById("canvas").clientWidth;
+const H = () => document.getElementById("canvas").clientHeight;
+
+// Zoom behaviour — D3 zoom applied to the inner <g> so nodes keep their positions.
+const zoomBeh = d3.zoom()
+  .scaleExtent([0.02, 8])
+  .on("zoom", e => zoomG.attr("transform", e.transform));
+svg.call(zoomBeh);
+svg.on("click", () => { tipEl.style.display = "none"; });
+
+// ── Simulation parameters ──────────────────────────────────────────────────
+
+// Global sim params read from Prefs once at startup; per-node physics comes
+// directly from node attributes sent by the server (PhysicsMixin defaults,
+// overridable via Prefs.get("nodePhysics", nodeType)).
+const SIM = Prefs.get("simulation");
+
+// The set of edge types that belong to the temporal spine (used by angle force).
+const TEMPORAL = new Set(["timeline-decade","decade-year","year-month","month-week"]);
+
+// Link widths by edge type — purely visual, not physics.
+const LINK_WIDTH = {
+  "timeline-decade": 2.0, "decade-year": 1.8, "year-month": 1.5,
+  "month-week": 1.2, "week-release": 0.6,
+  "release-artist": 1.0, "artist-release": 1.0, "artist-artist": 0.7,
+};
+
+function linkStyle(sel) {
+  sel
+    .attr("stroke", d => {
+      const key = `${d.source.node_type}-${d.target.node_type}`;
+      // Prefs.get returns the full linkColour section; look up by key.
+      return Prefs.get("linkColour", key) || "#333";
+    })
+    .attr("stroke-width", d => LINK_WIDTH[`${d.source.node_type}-${d.target.node_type}`] ?? 0.8);
+}
+
+// ── Temporal angle force ───────────────────────────────────────────────────
+//
+// Returns the ideal spawn angle for a temporal child relative to its parent.
+// Decade: spread across 360° by decade number; year/month/week similarly.
+function _temporalAngle(child) {
+  if (child.node_type === "decade" && child.decade != null) {
+    const total = Math.ceil((2030 - 1950) / 10);
+    return ((child.decade - 1950) / 10) / total * 2 * Math.PI - Math.PI / 2;
+  }
+  if (child.node_type === "year"  && child.year  != null)
+    return (child.year % 10) / 10 * 2 * Math.PI - Math.PI / 2;
+  if (child.node_type === "month" && child.month != null)
+    return (child.month - 1) / 12 * 2 * Math.PI - Math.PI / 2;
+  if (child.node_type === "week"  && child.date)
+    return (parseInt(child.date.split("-")[2]) - 1) / 35 * 2 * Math.PI - Math.PI / 2;
+  return null;
+}
+
+// Custom force: angular spring that pulls each temporal node toward its home
+// angle relative to its temporal parent, while allowing radial movement.
+function temporalAngleForce(strength, radialStrength) {
+  let nodes, nodeById = new Map();
+  function force(alpha) {
+    for (const n of nodes) {
+      if (n._homeAngle === undefined || n._temporalParentId === undefined) continue;
+      const parent = nodeById.get(n._temporalParentId);
+      if (!parent) continue;
+      const dx = n.x - parent.x, dy = n.y - parent.y;
+      const r  = Math.sqrt(dx * dx + dy * dy);
+      if (r < 1) continue;
+      const θCur = Math.atan2(dy, dx);
+      // Angular spring
+      let dθ = n._homeAngle - θCur;
+      while (dθ >  Math.PI) dθ -= 2 * Math.PI;
+      while (dθ < -Math.PI) dθ += 2 * Math.PI;
+      const af = dθ * strength * alpha;
+      n.vx += -Math.sin(θCur) * af;
+      n.vy +=  Math.cos(θCur) * af;
+      // Radial spring — gentle resistance to being dragged inward by children
+      if (n._targetRadius !== undefined) {
+        const rf = (r - n._targetRadius) * radialStrength * alpha;
+        n.vx -= (dx / r) * rf;
+        n.vy -= (dy / r) * rf;
+      }
+    }
+  }
+  force.initialize = ns => { nodes = ns; nodeById = new Map(ns.map(n => [n.id, n])); };
+  return force;
+}
+
+// ── Simulation ─────────────────────────────────────────────────────────────
+
+const sim = d3.forceSimulation()
+  .force("link", d3.forceLink().id(d => d.id)
+    // Distance comes from the target node's target_radius (PhysicsMixin).
+    .distance(d => d.target.target_radius ?? 80)
+    .strength(d => {
+      const k   = `${d.source.node_type}-${d.target.node_type}`;
+      const tgt = d.target;
+      // Spine links use the target node's link_strength directly.
+      if (TEMPORAL.has(k)) return tgt.link_strength ?? 0.8;
+      // Release–artist strength scales with chart score when available.
+      if (k === "artist-release" || k === "release-artist") {
+        const rel   = d.source.node_type === "release" ? d.source : d.target;
+        const base  = rel.link_strength ?? 0.55;
+        const score = rel.chart_score || 0;
+        return score > 0
+          ? Math.min(base * 1.55, Math.max(0.05, Math.sqrt(score) / 9))
+          : base;
+      }
+      // Week–release strength scales with run length and score.
+      if (k === "week-release") {
+        const rl    = d.run_length || 1;
+        const score = tgt.chart_score || 0;
+        const cap   = tgt.link_strength ?? 0.45;
+        return Math.min(0.06 + rl * 0.02 + Math.sqrt(score) * 0.025, cap);
+      }
+      // All other link types use the target node's base link_strength.
+      return tgt.link_strength ?? 0.4;
+    })
+  )
+  .force("charge",  d3.forceManyBody()
+    // charge comes from the node's PhysicsMixin attribute.
+    .strength(d => d.charge ?? -30)
+    .distanceMax(SIM.chargeDistMax)
+  )
+  .force("collide", d3.forceCollide().radius(d => radius(d) + (d.collide_pad ?? SIM.collidePad ?? 3)))
+  .force("center",  d3.forceCenter(0, 0).strength(SIM.centerStrength))
+  .force("temporal-angle", temporalAngleForce(SIM.angleStrength, SIM.radialStrength))
+  .alphaDecay(SIM.alphaDecay)
+  .velocityDecay(SIM.velocityDecay)
+  .on("tick", tick);
+
+// ── Graph state ────────────────────────────────────────────────────────────
+
+let gNodes = [];    // D3 node objects (augmented with x/y/vx/vy by sim)
+let gLinks = [];    // D3 link objects (source/target resolved to node objects)
+
+const visited  = new Set();   // node IDs whose expand result has been received
+const posCache = {};          // id → {x,y} — preserves positions across resets
+const linkSet  = new Set();   // "srcId~tgtId" keys — prevents duplicate edges
+
+// ── Node rendering ─────────────────────────────────────────────────────────
+
+// Split long labels across two tspan lines for week and month nodes.
+function applyLabel(sel) {
+  sel.each(function(d) {
+    const t = d3.select(this).text(null);
+    if (d.node_type === "week" && d.label.startsWith("New Entries ")) {
+      t.attr("dy", radius(d) + 6);
+      t.append("tspan").attr("x", 0).text("New Entries");
+      t.append("tspan").attr("x", 0).attr("dy", "1.1em").text(d.label.slice(12));
+    } else if (d.node_type === "month") {
+      const parts = d.label.split(" ");
+      t.attr("dy", radius(d) + 6);
+      t.append("tspan").attr("x", 0).text(parts[0] || "");
+      if (parts[1]) t.append("tspan").attr("x", 0).attr("dy", "1.1em").text(parts[1]);
+    } else {
+      t.attr("dy", radius(d) + 9).text(truncate(d.label, 16));
+    }
+  });
+}
+
+function _attachHandlers(sel) {
+  sel
+    .call(d3.drag()
+      .on("start", function(e, d) {
+        this._dragged = false;
+        if (!e.active) sim.alphaTarget(SIM.dragAlpha).restart();
+        d.fx = d.x; d.fy = d.y;
+      })
+      .on("drag",  function(e, d) { this._dragged = true; d.fx = e.x; d.fy = e.y; })
+      .on("end",   function(e, d) {
+        if (!e.active) sim.alphaTarget(0);
+        d.fx = null; d.fy = null;
+      })
+    )
+    .on("click", function(e, d) {
+      e.stopPropagation();
+      if (this._dragged) return;
+
+      if (visited.has(d.id)) {
+        // Re-click: find the frontier — the nearest layer of unvisited nodes
+        // reachable from this node through already-visited nodes in the graph.
+        // Each re-click advances expansion one wave deeper without the user
+        // having to click every individual node at each level.
+        _frontier(d.id).forEach(n => _postExplore(n.id));
+      } else {
+        _postExplore(d.id);
+      }
+    })
+    .on("mousemove",  (e, d) => showTip(e, d))
+    .on("mouseleave", ()     => { tipEl.style.display = "none"; _tipNode = null; });
+}
+
+// Append a new node group to the SVG immediately (live insert, no full redraw).
+function liveAddNode(nd) {
+  const g = nodeG.append("g").attr("class", "node").datum(nd)
+    .attr("transform", `translate(${nd.x},${nd.y})`);
+  _attachHandlers(g);
+  g.append("circle")
+    .attr("r",      radius(nd))
+    .attr("fill",   colour(nd))
+    .attr("stroke", "#0a0a0a");
+  applyLabel(g.append("text"));
+}
+
+// Append a new link line to the SVG immediately.
+function liveAddEdge(link) {
+  linkStyle(linkG.append("line").attr("class", "link").datum(link));
+}
+
+// ── Physics helpers ─────────────────────────────────────────────────────────
+
+// Rebind the simulation every SIM.nudgeBatch new nodes and inject a capped
+// alpha burst.  The cap prevents blob collapse that bare sim.restart()
+// (alpha → 1) caused during large cascades.
+let _nudgeCount = 0;
+function nudgePhysics() {
+  if (++_nudgeCount % SIM.nudgeBatch === 0) {
+    sim.nodes(gNodes);
+    sim.force("link").links(gLinks);
+    sim.alpha(Math.max(sim.alpha(), SIM.nudgeAlpha)).restart();
+  }
+}
+
+// ── Graph core ──────────────────────────────────────────────────────────────
+
+// Walk outward from startId through already-visited nodes until hitting
+// unvisited ones.  Returns that nearest unvisited layer — the "frontier".
+// Each re-click on a visited node calls this so the user can step expansion
+// one wave at a time without clicking every node individually.
+function _frontier(startId) {
+  const out  = [];
+  const seen = new Set([startId]);   // prevents revisiting nodes in this walk
+  const queue = [startId];
+  while (queue.length) {
+    const id = queue.shift();
+    for (const link of gLinks) {
+      // Follow outbound edges from this node.
+      if (link.source.id !== id) continue;
+      const child = gNodes.find(n => n.id === link.target.id);
+      if (!child || seen.has(child.id)) continue;
+      seen.add(child.id);
+      if (!visited.has(child.id)) {
+        out.push(child);      // unvisited — this is the frontier; stop here
+      } else {
+        queue.push(child.id); // already visited — keep walking through it
+      }
+    }
+  }
+  return out;
+}
+
+// Add an edge between two nodes, deduplicating by node-ID pair.
+function addEdge(srcId, tgtId, attrs = {}) {
+  const key = `${srcId}~${tgtId}`;
+  if (linkSet.has(key) || linkSet.has(`${tgtId}~${srcId}`)) return null;
+  linkSet.add(key);
+  const src = gNodes.find(n => n.id === srcId);
+  const tgt = gNodes.find(n => n.id === tgtId);
+  if (!src || !tgt) return null;
+  const link = { source: src, target: tgt, ...attrs };
+  gLinks.push(link);
+  return link;
+}
+
+// Add a child node (and its edge to parent) to the live graph.
+// Returns true if the node was new, false if it already existed (edge-only add).
+function addChild(child, parentId) {
+  const attrs    = child.run_length ? { run_length: child.run_length } : {};
+  const existing = gNodes.find(n => n.id === child.id);
+
+  if (!existing) {
+    const parent = gNodes.find(n => n.id === parentId);
+    // Orphan guard: parent must exist for new nodes.  Without this, stale
+    // SSE events from before a reset create unattached floating nodes.
+    if (!parent) return false;
+    const prev   = posCache[child.id];    // reuse last known position if available
+    let nd;
+
+    const angle  = _temporalAngle(child);
+    const spread = child.child_spread ?? SIM.defaultSpread ?? 80;
+    if (prev) {
+      nd = { ...child, x: prev.x, y: prev.y, vx: 0, vy: 0 };
+    } else if (parent && angle !== null) {
+      // Temporal children: spawn at their home angle at target_radius from parent.
+      const r = child.target_radius ?? 100;
+      nd = { ...child,
+        x: parent.x + r * Math.cos(angle),
+        y: parent.y + r * Math.sin(angle),
+        vx: 0, vy: 0,
+      };
+    } else {
+      // Chart nodes: scatter around parent using child_spread from PhysicsMixin.
+      nd = { ...child,
+        x: parent ? parent.x + (Math.random() - 0.5) * spread : (Math.random() - 0.5) * 600,
+        y: parent ? parent.y + (Math.random() - 0.5) * spread : (Math.random() - 0.5) * 600,
+        vx: 0, vy: 0,
+      };
+    }
+
+    // Temporal angle spring needs a fixed parent reference and target distance.
+    if (angle !== null) {
+      nd._homeAngle      = angle;
+      nd._temporalParentId = parentId;
+      nd._targetRadius   = child.target_radius ?? 100;
+    }
+
+    gNodes.push(nd);
+    liveAddNode(nd);
+    const link = addEdge(parentId, child.id, attrs);
+    if (link) liveAddEdge(link);
+    nudgePhysics();
+    return true;
+  } else {
+    const link = addEdge(parentId, child.id, attrs);
+    if (link) liveAddEdge(link);
+    return false;
+  }
+}
+
+// ── SSE client ─────────────────────────────────────────────────────────────
+//
+// The server pushes three event types:
+//   expand    — node finished expanding; children list ready to render
+//   status    — in-progress update with queue depth
+//   done      — queue empty, all workers idle
+//   heartbeat — keepalive (ignored)
+
+let _sse = null;
+
+function _setupSSE() {
+  if (_sse) _sse.close();
+  _sse = new EventSource("/stream");
+  _sse.addEventListener("expand", e => {
+    const data = JSON.parse(e.data);
+    const nd   = gNodes.find(n => n.id === data.node_id);
+
+    // Mark this node as fully expanded so tooltip stops showing "click → expand"
+    visited.add(data.node_id);
+
+    // Update circle stroke: red on error, transparent (dark bg) on success
+    if (nd) {
+      nd.status = data.status;
+      nodeG.selectAll("g.node").filter(d => d.id === data.node_id)
+        .select("circle").attr("stroke", data.status === "error" ? "#f44" : "#0a0a0a");
+    }
+
+    // Render all children streamed by the server
+    for (const child of (data.children || [])) {
+      addChild(child, child.parent_id ?? data.node_id);
+    }
+
+    // Always nudge after each expand batch — nudgePhysics only fires every N
+    // nodes so small expansions (< nudgeBatch) would otherwise never rebind.
+    sim.nodes(gNodes);
+    sim.force("link").links(gLinks);
+    sim.alpha(Math.max(sim.alpha(), SIM.nudgeAlpha)).restart();
+
+    actLog(data.label, data.status === "error" ? "error" : "done");
+  });
+
+  _sse.addEventListener("status", e => {
+    const data = JSON.parse(e.data);
+    setStatus(`${gNodes.length} nodes · ${gLinks.length} edges · ${data.queued} queued`);
+    updateQBar(data.queued);
+  });
+
+  _sse.addEventListener("done", () => {
+    setStatus(`Done. ${gNodes.length} nodes · ${gLinks.length} edges`);
+    updateQBar(0);
+  });
+
+  _sse.addEventListener("heartbeat", () => {});
+
+  _sse.onerror = () => setStatus("Connection lost — is server.py still running?");
+}
+
+_setupSSE();
+
+// ── Server API wrappers ─────────────────────────────────────────────────────
+
+// POST to /explore/<id> — user-initiated node expansion.
+function _postExplore(nodeId) {
+  const nd = gNodes.find(n => n.id === nodeId);
+  if (nd) actLog(nd.label, "pending");
+  fetch(`/explore/${nodeId}`, { method: "POST" }).catch(() => {});
+}
+
+// POST to a control endpoint (pause / resume / stop).
+function _postCmd(cmd) {
+  fetch(`/${cmd}`, { method: "POST" }).catch(() => {});
+}
+
+// ── Toolbar controls ────────────────────────────────────────────────────────
+
+let _paused = false;   // mirrors server pause state for button label/class
+
+function togglePause() {
+  _paused = !_paused;
+  const btn = document.getElementById("pause-btn");
+  btn.textContent = _paused ? "Resume" : "Pause";
+  btn.classList.toggle("paused", _paused);
+  _postCmd(_paused ? "pause" : "resume");
+}
+
+function stopCascade() {
+  _paused = false;
+  const btn = document.getElementById("pause-btn");
+  btn.textContent = "Pause";
+  btn.classList.remove("paused");
+  _postCmd("stop");
+  setStatus(`Stopped. ${gNodes.length} nodes · ${gLinks.length} edges`);
+  updateQBar(0);
+}
+
+// ── Full redraw ─────────────────────────────────────────────────────────────
+//
+// Called after resetGraph() clears the arrays, and after chart mode changes.
+// Live adds (liveAddNode/liveAddEdge) are used during streaming; this is only
+// for full re-renders from scratch.
+
+function redraw() {
+  const lSel = linkG.selectAll("line.link")
+    .data(gLinks, d => `${d.source.id ?? d.source}~${d.target.id ?? d.target}`);
+  linkStyle(lSel.enter().append("line").attr("class", "link"));
+  lSel.exit().remove();
+
+  const nSel   = nodeG.selectAll("g.node").data(gNodes, d => d.id);
+  const nEnter = nSel.enter().append("g").attr("class", "node");
+  _attachHandlers(nEnter);
+  nEnter.append("circle");
+  nEnter.append("text");
+  nSel.merge(nEnter)
+    .attr("transform", d => `translate(${d.x ?? 0},${d.y ?? 0})`);
+  nSel.merge(nEnter).select("circle")
+    .attr("r",      d => radius(d))
+    .attr("fill",   d => colour(d))
+    .attr("stroke", d => d.status === "error" ? "#f44" : d.status === "fetching" ? "#fff" : "#0a0a0a");
+  applyLabel(nSel.merge(nEnter).select("text"));
+  nSel.exit().remove();
+
+  sim.nodes(gNodes);
+  sim.force("link").links(gLinks);
+  sim.alpha(SIM.dragAlpha).restart();
+  updateQBar(0);
+}
+
+function tick() {
+  // Save positions every tick so they survive a graph reset.
+  gNodes.forEach(d => { posCache[d.id] = { x: d.x, y: d.y }; });
+
+  linkG.selectAll("line.link")
+    .attr("x1", d => d.source.x).attr("y1", d => d.source.y)
+    .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
+
+  nodeG.selectAll("g.node")
+    .attr("transform", d => `translate(${d.x},${d.y})`);
+}
+
+// ── UI helpers ──────────────────────────────────────────────────────────────
+
+// Strip leading "The " and truncate with ellipsis.
+function truncate(s, n) {
+  s = (s || "").replace(/^The\s+/i, "");
+  return s.length > n ? s.slice(0, n - 1) + "…" : s;
+}
+
+const _actMap = new Map();
+function actLog(lbl, st) {
+  _actMap.set(lbl, st);
+  const entries = [..._actMap.entries()].slice(-20);
+  actEl.innerHTML = entries.map(([l, s]) =>
+    `<div class="act-row"><span class="act-lbl">${l}</span><span class="act-s-${s}">${s}</span></div>`
+  ).join("");
+  actEl.scrollTop = actEl.scrollHeight;
+}
+
+function setStatus(msg)         { statusEl.textContent = msg; }
+function updateQBar(queued = 0) { qBar.textContent = queued > 0 ? `${queued} queued` : ""; }
+
+// ── Tooltip ─────────────────────────────────────────────────────────────────
+//
+// For release nodes that haven't been expanded yet, silently fetch chart stats
+// via GET /stats/<id> and refresh the tooltip if still open.
+
+let _tipNode = null, _tipEvent = null;
+
+function showTip(e, d) {
+  tipEl.style.display = "block";
+
+  // Lazy-fetch chart stats for unexpanded releases (chart_score still 0)
+  if (d.node_type === "release" && !d.peak_position && !d._statsFetching) {
+    d._statsFetching = true;
+    fetch(`/stats/${d.id}`).then(r => r.json()).then(s => {
+      if (s.peak_position) {
+        d.peak_position = s.peak_position;
+        d.total_weeks   = s.total_weeks;
+        d.chart_from    = s.chart_from;
+        d.chart_to      = s.chart_to;
+        d.chart_score   = s.chart_score;
+        if (_tipNode === d) showTip(_tipEvent, d);   // refresh if still open
+      }
+    }).catch(() => {});
+  }
+
+  _tipNode  = d;
+  _tipEvent = e;
+
+  // Position tooltip near cursor, flipping if it would overflow the canvas.
+  const r  = document.getElementById("canvas").getBoundingClientRect();
+  let tx   = e.clientX - r.left + 14;
+  let ty   = e.clientY - r.top  + 14;
+  if (tx + 230 > r.width)  tx = e.clientX - r.left - 240;
+  if (ty + 70  > r.height) ty = e.clientY - r.top  - 80;
+  tipEl.style.left = tx + "px";
+  tipEl.style.top  = ty + "px";
+
+  let html =
+    `<div class="tip-type">${d.node_type}${d.medium ? " — " + d.medium : ""}</div>` +
+    `<strong>${d.label || d.id}</strong>`;
+
+  if (d.node_type === "release") {
+    if (d.peak_position) {
+      html += `<br><span style="color:#aaa">Peak: #${d.peak_position}</span>`;
+      if (d.total_weeks)
+        html += `<span style="color:#666"> · ${d.total_weeks} week${d.total_weeks > 1 ? "s" : ""}</span>`;
+      if (d.chart_from && d.chart_to && d.chart_from !== d.chart_to)
+        html += `<br><span style="color:#666;font-size:9px">${d.chart_from} → ${d.chart_to}</span>`;
+      else if (d.chart_from)
+        html += `<br><span style="color:#666;font-size:9px">${d.chart_from}</span>`;
+    } else if (d.position) {
+      html += `<br><span style="color:#aaa">Position: #${d.position}</span>`;
+      if (d.chart_date)
+        html += `<span style="color:#666;font-size:9px"> · ${d.chart_date}</span>`;
+    }
+    if (d.artist) html += `<br><span style="color:#888">${d.artist}</span>`;
+  } else {
+    if (d.chart_date) html += `<br><span style="color:#888">charted ${d.chart_date}</span>`;
+  }
+
+  if (d.path) html += `<br><span style="color:#555;font-size:9px">${d.path}</span>`;
+  if (d.status && d.status !== "done")
+    html += `<br><span style="color:#c62828">${d.status}</span>`;
+  if (!visited.has(d.id))
+    html += `<br><span style="color:#29b6f6">click → expand</span>`;
+
+  tipEl.innerHTML = html;
+}
+
+// ── Chart mode toggle ───────────────────────────────────────────────────────
+
+let _chartMode = "albums";
+
+function setChart(mode) {
+  if (mode === _chartMode) return;
+  _chartMode = mode;
+  document.getElementById("tog-albums").classList.toggle("active",  mode === "albums");
+  document.getElementById("tog-singles").classList.toggle("active", mode === "singles");
+  document.getElementById("tog-both").classList.toggle("active",    mode === "both");
+  resetGraph();
+}
+
+// ── Artist search ───────────────────────────────────────────────────────────
+
+const searchInput   = document.getElementById("search-input");
+const searchResults = document.getElementById("search-results");
+let _searchTimer = null;
+
+// Debounce: fire the search 300 ms after the user stops typing.
+searchInput.addEventListener("input", () => {
+  clearTimeout(_searchTimer);
+  const terms = searchInput.value.trim();
+  if (!terms) { searchResults.style.display = "none"; return; }
+  _searchTimer = setTimeout(async () => {
+    const res  = await fetch(`/search?terms=${encodeURIComponent(terms)}`);
+    const data = await res.json();
+    const list = data.artists || [];
+    if (!list.length) { searchResults.style.display = "none"; return; }
+    searchResults.innerHTML = list.map(a =>
+      `<div class="sr-item" data-path="${a.path}" data-name="${a.title}">${a.title}</div>`
+    ).join("");
+    searchResults.style.display = "block";
+  }, 300);
+});
+
+// Close the results dropdown on any outside click.
+document.addEventListener("click", e => {
+  if (!searchInput.contains(e.target) && !searchResults.contains(e.target))
+    searchResults.style.display = "none";
+});
+
+// Create an ArtistNode, attach it to the timeline root, then trigger expansion.
+async function _addArtistItem(path, name) {
+  const res  = await fetch(`/add-artist?path=${encodeURIComponent(path)}&name=${encodeURIComponent(name)}`);
+  const data = await res.json();
+  if (data.error || !data.node) return;
+  const root = gNodes.find(n => n.node_type === "timeline");
+  addChild(data.node, root ? root.id : gNodes[0]?.id);
+  _postExplore(data.node.id);
+}
+
+// Click on a result row to add just that artist.
+searchResults.addEventListener("click", async e => {
+  const item = e.target.closest(".sr-item");
+  if (!item) return;
+  searchResults.style.display = "none";
+  searchInput.value = "";
+  await _addArtistItem(item.dataset.path, item.dataset.name);
+});
+
+// Enter on the search box to add all results at once.
+searchInput.addEventListener("keydown", async e => {
+  if (e.key !== "Enter") return;
+  const items = [...searchResults.querySelectorAll(".sr-item")];
+  if (!items.length) return;
+  searchResults.style.display = "none";
+  searchInput.value = "";
+  await Promise.all(items.map(item => _addArtistItem(item.dataset.path, item.dataset.name)));
+});
+
+// ── Boot ────────────────────────────────────────────────────────────────────
+
+async function resetGraph() {
+  sim.stop();
+  _nudgeCount = 0;
+
+  // Clear all local graph state
+  gNodes = [];
+  gLinks = [];
+  visited.clear();
+  linkSet.clear();
+  _actMap.clear();
+  Object.keys(posCache).forEach(k => delete posCache[k]);
+
+  // Reset pause button
+  _paused = false;
+  document.getElementById("pause-btn").textContent = "Pause";
+  document.getElementById("pause-btn").classList.remove("paused");
+
+  redraw();
+  setStatus("Loading…");
+
+  // Recreate the SSE connection so stale events from the old cascade are
+  // discarded and can't create orphan nodes in the new graph.
+  _setupSSE();
+
+  try {
+    // Ask the server to reset its node graph and return the root node
+    const res  = await fetch(`/root?chart=${_chartMode}`);
+    const data = await res.json();
+    const root = data.node;
+
+    // Anchor the timeline root at the origin so the spine radiates outward
+    gNodes.push({ ...root, x: 0, y: 0, fx: 0, fy: 0 });
+    redraw();
+    svg.call(zoomBeh.transform, d3.zoomIdentity.translate(W() / 2, H() / 2).scale(1));
+
+    // If the server has already started expanding (auto_expand=True on root),
+    // the BFS is running — otherwise the user clicks the timeline node to begin.
+    setStatus(data.auto_expanding ? "Expanding…" : "Click the timeline node to begin.");
+  } catch {
+    setStatus("Server error — is server.py running?");
+  }
+}
+
+resetGraph();
+</script>
+</body>
+</html>
