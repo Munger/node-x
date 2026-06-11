@@ -398,9 +398,10 @@ class TemporalChartNode(TemporalMixin, ChartNode):
 # Time spine  (no HTTP)
 # ---------------------------------------------------------------------------
 
-class Timeline(GraphBehavior, RenderMixin, PhysicsMixin, StreamMixin, Node):
-    """Single seed node. Streams DecadeNodes newest-first."""
+class Timeline(ChartNode):
+    """Single root node. Streams DecadeNodes newest-first. The natural snapshot root for the whole graph."""
     _children: ClassVar[tuple] = ("decades",)
+    _restore_via_payload = True
     node_colour   = "#ccad00"
     node_radius   = 14      ## @brief Larger than all others — it is the root of the whole graph.
     target_radius = 0       ## @brief No parent, so no target distance.
@@ -426,6 +427,7 @@ class Timeline(GraphBehavior, RenderMixin, PhysicsMixin, StreamMixin, Node):
 class DecadeNode(TemporalChartNode):
     """A decade. Streams YearNodes. GraphMixin-keyed so it can be found from any direction."""
     _children: ClassVar[tuple] = ("years",)
+    _restore_via_payload = True
     node_colour   = "#cc7a00"
     node_radius   = 10
     target_radius = 220
@@ -451,6 +453,7 @@ class DecadeNode(TemporalChartNode):
 class YearNode(TemporalChartNode):
     """A calendar year. Streams MonthNodes downward; parents() links up to its DecadeNode."""
     _children: ClassVar[tuple] = ("months",)
+    _restore_via_payload = True
     node_colour   = "#e05a00"
     node_radius   = 8
     target_radius = 160
@@ -483,6 +486,7 @@ class YearNode(TemporalChartNode):
 class MonthNode(TemporalChartNode):
     """A calendar month. Streams WeekNodes downward; parents() links up to its YearNode."""
     _children: ClassVar[tuple] = ("weeks",)
+    _restore_via_payload = True
     node_colour   = "#c0392b"
     node_radius   = 6
     target_radius = 120
@@ -521,6 +525,7 @@ class MonthNode(TemporalChartNode):
 class WeekNode(TemporalChartNode):
     """One weekly chart. Fetches entries downward; parents() links up to its MonthNode."""
     _children: ClassVar[tuple] = ("releases",)
+    _restore_via_payload = True
     node_colour   = "#3949ab"
     node_radius   = 5
     target_radius = 80
@@ -580,6 +585,7 @@ class WeekNode(TemporalChartNode):
 class ArtistNode(ChartNode):
     """An artist. Fetches discography, streams ReleaseNodes for the active chart type."""
     _children: ClassVar[tuple] = ("releases",)
+    _restore_via_payload = True
     node_colour   = "#2e7d32"
     node_radius   = 7       ## @brief Slightly larger than releases — artists are the anchor of the cluster.
     target_radius = 50
@@ -665,6 +671,7 @@ class ArtistNode(ChartNode):
 class ReleaseNode(ChartNode):
     """A charting release. Wires itself into the time spine on first discovery; streams its artist."""
     _children: ClassVar[tuple] = ("artist_node", "chart_weeks")
+    _restore_via_payload = True
     node_colour   = "#1a237e"
     node_radius   = 5
     target_radius = 70
@@ -739,3 +746,28 @@ class ReleaseNode(ChartNode):
             yield from self["artist_node"]
         # Reverse chain: all weeks this release charted in
         yield from (self.get("chart_weeks") or [])
+
+
+# ---------------------------------------------------------------------------
+# Child-field restore declarations
+#
+# _list_fields and _node_fields cannot be set inside the class bodies above
+# because each entry references a class defined later in the file (forward
+# references).  Setting them here, after all classes exist, resolves that
+# without changing the structure of the classes themselves.
+# ---------------------------------------------------------------------------
+
+Timeline._list_fields   = {"decades":  (DecadeList,           DecadeNode)}
+DecadeNode._list_fields = {"years":    (YearList,             YearNode)}
+YearNode._list_fields   = {"months":   (MonthList,            MonthNode)}
+MonthNode._list_fields  = {"weeks":    (WeekList,             WeekNode)}
+WeekNode._list_fields   = {"releases": (ReleaseList,          ReleaseNode)}
+ArtistNode._list_fields = {"releases": (ReleaseList,          ReleaseNode)}
+
+# ReleaseNode has two list children and one plain-Node child.
+# WeekNode and ArtistNode are both defined by this point so no forward refs.
+ReleaseNode._list_fields = {
+    "chart_weeks": (WeekList,             WeekNode),
+    "artist_node": (SerialisableNodeList, ArtistNode),
+}
+ReleaseNode._node_fields = {"run_lengths": Node}

@@ -471,12 +471,12 @@ def _init() -> Timeline:
     otherwise the client must POST /explore/<root_id> to begin.
     """
     global _root
-    for cls in (DecadeNode, YearNode, MonthNode, WeekNode, ArtistNode, ReleaseNode):
+    for cls in (Timeline, DecadeNode, YearNode, MonthNode, WeekNode, ArtistNode, ReleaseNode):
         cls.clear_registry()
     with _registry_lock:
         _node_registry.clear()
     _bfs.reset()
-    _root = Timeline({})
+    _root = Timeline.get_or_create("timeline", {})
     _register(_root)
     _bfs._root_id = id(_root)    # workers use this to anchor the temporal spine
     return _root
