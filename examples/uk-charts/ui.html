@@ -67,6 +67,14 @@
   <div id="tip"></div>
 </div>
 
+<div id="console-panel">
+  <div id="console-toolbar">
+    <span class="con-title">Console</span>
+    <button class="con-btn" onclick="document.getElementById('console-lines').innerHTML=''">Clear</button>
+  </div>
+  <div id="console-lines"></div>
+</div>
+
 <script src="https://d3js.org/d3.v7.min.js"></script>
 <script>
 "use strict";
@@ -247,7 +255,6 @@ const sim = d3.forceSimulation()
 let gNodes = [];    // D3 node objects (augmented with x/y/vx/vy by sim)
 let gLinks = [];    // D3 link objects (source/target resolved to node objects)
 
-const visited  = new Set();   // node IDs whose expand result has been received
 const posCache = {};          // id → {x,y} — preserves positions across resets
 const linkSet  = new Set();   // "srcId~tgtId" keys — prevents duplicate edges
 
@@ -283,22 +290,14 @@ function _attachHandlers(sel) {
       .on("drag",  function(e, d) { this._dragged = true; d.fx = e.x; d.fy = e.y; })
       .on("end",   function(e, d) {
         if (!e.active) sim.alphaTarget(0);
-        d.fx = null; d.fy = null;
+        if (d.node_type !== "timeline") { d.fx = null; d.fy = null; }
       })
     )
     .on("click", function(e, d) {
       e.stopPropagation();
       if (this._dragged) return;
 
-      if (visited.has(d.id)) {
-        // Re-click: find the frontier — the nearest layer of unvisited nodes
-        // reachable from this node through already-visited nodes in the graph.
-        // Each re-click advances expansion one wave deeper without the user
-        // having to click every individual node at each level.
-        _frontier(d.id).forEach(n => _postExplore(n.id));
-      } else {
-        _postExplore(d.id);
-      }
+      _postExplore(d.id);
     })
     .on("mousemove",  (e, d) => showTip(e, d))
     .on("mouseleave", ()     => { tipEl.style.display = "none"; _tipNode = null; });
@@ -337,31 +336,6 @@ function nudgePhysics() {
 
 // ── Graph core ──────────────────────────────────────────────────────────────
 
-// Walk outward from startId through already-visited nodes until hitting
-// unvisited ones.  Returns that nearest unvisited layer — the "frontier".
-// Each re-click on a visited node calls this so the user can step expansion
-// one wave at a time without clicking every node individually.
-function _frontier(startId) {
-  const out  = [];
-  const seen = new Set([startId]);   // prevents revisiting nodes in this walk
-  const queue = [startId];
-  while (queue.length) {
-    const id = queue.shift();
-    for (const link of gLinks) {
-      // Follow outbound edges from this node.
-      if (link.source.id !== id) continue;
-      const child = gNodes.find(n => n.id === link.target.id);
-      if (!child || seen.has(child.id)) continue;
-      seen.add(child.id);
-      if (!visited.has(child.id)) {
-        out.push(child);      // unvisited — this is the frontier; stop here
-      } else {
-        queue.push(child.id); // already visited — keep walking through it
-      }
-    }
-  }
-  return out;
-}
 
 // Add an edge between two nodes, deduplicating by node-ID pair.
 function addEdge(srcId, tgtId, attrs = {}) {
@@ -404,11 +378,15 @@ function addChild(child, parentId) {
       };
     } else {
       // Chart nodes: scatter around parent using child_spread from PhysicsMixin.
-      nd = { ...child,
-        x: parent ? parent.x + (Math.random() - 0.5) * spread : (Math.random() - 0.5) * 600,
-        y: parent ? parent.y + (Math.random() - 0.5) * spread : (Math.random() - 0.5) * 600,
-        vx: 0, vy: 0,
-      };
+      // Use a random direction + guaranteed minimum distance (half of spread) so
+      // the child never spawns on top of the parent node.
+      if (parent) {
+        const θ = Math.random() * 2 * Math.PI;
+        const r = spread * (0.5 + 0.5 * Math.random());
+        nd = { ...child, x: parent.x + r * Math.cos(θ), y: parent.y + r * Math.sin(θ), vx: 0, vy: 0 };
+      } else {
+        nd = { ...child, x: (Math.random() - 0.5) * 600, y: (Math.random() - 0.5) * 600, vx: 0, vy: 0 };
+      }
     }
 
     // Temporal angle spring needs a fixed parent reference and target distance.
@@ -433,8 +411,8 @@ function addChild(child, parentId) {
 
 // ── SSE client ─────────────────────────────────────────────────────────────
 //
-// The server pushes three event types:
-//   expand    — node finished expanding; children list ready to render
+// The server pushes these event types:
+//   node      — one new node streamed as it is created; parent_id links it to its parent
 //   status    — in-progress update with queue depth
 //   done      — queue empty, all workers idle
 //   heartbeat — keepalive (ignored)
@@ -445,32 +423,25 @@ function _setupSSE() {
   if (_sse) _sse.close();
   _sse = new EventSource("/stream");
   _sse._ready = new Promise(res => _sse.addEventListener("open", res, { once: true }));
-  _sse.addEventListener("expand", e => {
+  _sse.addEventListener("node", e => {
     const data = JSON.parse(e.data);
-    const nd   = gNodes.find(n => n.id === data.node_id);
-
-    // Mark this node as fully expanded so tooltip stops showing "click → expand"
-    visited.add(data.node_id);
-
-    // Update circle stroke: red on error, transparent (dark bg) on success
-    if (nd) {
-      nd.status = data.status;
-      nodeG.selectAll("g.node").filter(d => d.id === data.node_id)
-        .select("circle").attr("stroke", data.status === "error" ? "#f44" : "#0a0a0a");
-    }
-
-    // Render all children streamed by the server
-    for (const child of (data.children || [])) {
-      addChild(child, child.parent_id ?? data.node_id);
-    }
-
-    // Always nudge after each expand batch — nudgePhysics only fires every N
-    // nodes so small expansions (< nudgeBatch) would otherwise never rebind.
+    addChild(data, data.parent_id);
+    // nudgePhysics() inside addChild only fires every nudgeBatch nodes.
+    // Always rebind here so small expansions (< nudgeBatch) still get physics.
     sim.nodes(gNodes);
     sim.force("link").links(gLinks);
     sim.alpha(Math.max(sim.alpha(), SIM.nudgeAlpha)).restart();
+  });
 
-    actLog(data.label, data.status || "done");
+  _sse.addEventListener("expanded", e => {
+    const data = JSON.parse(e.data);
+    if (data.label) actLog(data.label, data.status || "done");
+    if (data.status === "error") {
+      conLog(`✗ ${data.label || data.id}: ${data.error || "unknown error"}`, "error");
+      if (data.trace) conLog(data.trace, "trace");
+    }
+    nodeG.selectAll("g.node").filter(d => d.id === data.id)
+      .select("circle").attr("stroke", data.status === "error" ? "#f44" : "#0a0a0a");
   });
 
   _sse.addEventListener("status", e => {
@@ -592,6 +563,17 @@ function actLog(lbl, st) {
 function setStatus(msg)         { statusEl.textContent = msg; }
 function updateQBar(queued = 0) { qBar.textContent = queued > 0 ? `${queued} queued` : ""; }
 
+// ── Console panel ────────────────────────────────────────────────────────────
+
+const conLines = document.getElementById("console-lines");
+function conLog(msg, cls = "info") {
+  const line = document.createElement("div");
+  line.className = `con-line ${cls}`;
+  line.textContent = msg;
+  conLines.appendChild(line);
+  conLines.scrollTop = conLines.scrollHeight;
+}
+
 // ── Tooltip ─────────────────────────────────────────────────────────────────
 //
 // For release nodes that haven't been expanded yet, silently fetch chart stats
@@ -655,8 +637,6 @@ function showTip(e, d) {
   if (d.path) html += `<br><span style="color:#555;font-size:9px">${d.path}</span>`;
   if (d.status && d.status !== "done")
     html += `<br><span style="color:#c62828">${d.status}</span>`;
-  if (!visited.has(d.id))
-    html += `<br><span style="color:#29b6f6">click → expand</span>`;
 
   tipEl.innerHTML = html;
 }
@@ -741,7 +721,6 @@ async function resetGraph() {
   // Clear all local graph state
   gNodes = [];
   gLinks = [];
-  visited.clear();
   linkSet.clear();
   _actMap.clear();
   Object.keys(posCache).forEach(k => delete posCache[k]);

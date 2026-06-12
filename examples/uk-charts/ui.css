@@ -214,6 +214,59 @@ svg { width: 100%; height: 100%; }
 .act-s-done     { color: #388e3c; }
 .act-s-error    { color: #c62828; }
 
+/* ── Console panel ────────────────────────────────────────────────────────── */
+
+#console-panel {
+  height: 150px;
+  display: flex;
+  flex-direction: column;
+  background: #000;
+  border-top: 2px solid #444;
+  flex-shrink: 0;
+}
+
+#console-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 8px;
+  background: #111;
+  border-bottom: 1px solid #333;
+}
+
+.con-title {
+  font-size: 10px;
+  color: #999;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  flex: 1;
+}
+
+.con-btn {
+  background: none;
+  border: 1px solid #555;
+  border-radius: 2px;
+  color: #aaa;
+  font-size: 9px;
+  font-family: inherit;
+  padding: 1px 5px;
+  cursor: pointer;
+}
+.con-btn:hover { color: #fff; border-color: #aaa; }
+
+#console-lines {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 8px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.con-line       { color: #e0e0e0; white-space: pre-wrap; word-break: break-all; }
+.con-line.error { color: #ff6b6b; }
+.con-line.trace { color: #888; font-size: 10px; }
+.con-line.info  { color: #b0bec5; }
+
 /* ── Queue depth indicator ────────────────────────────────────────────────── */
 
 #queue-bar {

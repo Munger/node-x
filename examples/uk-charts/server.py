@@ -9,12 +9,14 @@ High-level flow
 1.  Browser loads ui.html, opens a long-lived SSE connection on GET /stream.
 2.  User clicks a node (or the graph auto-starts) → browser POSTs /explore/<id>.
 3.  BFSManager.explore() pushes the node onto an internal queue.Queue.
-4.  A daemon worker thread picks it up, calls node.stream() via _expand_node(),
-    and broadcasts the result to every connected SSE client.
+4.  A daemon worker thread picks it up, calls _expand_node() to iterate the
+    node and serialise its children, then broadcasts the result to every
+    connected SSE client.
 5.  The browser receives the "expand" event, calls addChild() for each child,
     and the D3 force graph updates immediately.
-6.  _expand_node() cascades non-pre_visited children back onto the BFS queue
-    so the graph grows automatically without any client involvement.
+6.  The worker cascades children whose auto_expand flag is True back onto the
+    BFS queue so the graph grows automatically without client involvement.
+    Children with auto_expand=False wait for a user click.
 
 Pause / Resume
 ──────────────
@@ -24,9 +26,8 @@ all pending items so Resume carries on from exactly the same frontier.
 
 Stop
 ────
-Drains the queue and sets a _stop_flag.  Internal cascade pushes (inside
-_expand_node) are no-ops while stopped.  A user POST to /explore/<id> clears
-the flag and re-opens the queue.
+Drains the queue and sets a _stop_flag.  BFSManager.push() is a no-op while
+stopped.  A user POST to /explore/<id> clears the flag and re-opens the queue.
 
 SSE event types
 ───────────────
@@ -55,8 +56,8 @@ for _p in (_HERE, _HERE.parent, _HERE.parent.parent):
 
 import model
 from model import (
-    ArtistNode, DecadeNode, MonthNode,
-    ReleaseNode, TemporalMixin, Timeline, WeekNode, YearNode,
+    ArtistNode, ChartNode, DecadeNode, MonthNode,
+    ReleaseNode, Timeline, YearNode,
 )
 
 _UI_FILE  = _HERE / "ui.html"
@@ -139,93 +140,41 @@ def _node_info(node) -> dict:
 # BFS expansion logic
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _expand_node(node_id: int, root_id: int, gen: int = -1) -> dict:
+def _expand_node(node_id: int, gen: int = -1) -> None:
     """
-    Stream all children of node_id and return the SSE payload dict.
+    Iterate node_id and broadcast each child to SSE clients as it is created.
 
-    Also cascades non-pre_visited children back onto the BFS queue so the
-    graph grows without further client interaction.
-
-    root_id is the id() of the Timeline node; it anchors the start of every
-    temporal spine chain (decade → year → month → week).
+    The iteration does the work — parent chains are built, nodes are registered,
+    each child is broadcast immediately.  Nothing is returned; the SSE stream
+    is the result.
     """
     node = _lookup(node_id)
     if node is None:
-        return {"node_id": node_id, "label": "?", "children": [],
-                "status": "error", "error": "Node not found"}
-
-    children:   list = []
-    error:      str  = ""
-    seen_spine: set  = set()   # node IDs already added in this call (dedup temporal spine)
-
-    def _add_week_spine(wk, xref_id: int, run_lengths) -> None:
-        """
-        Insert the full decade→year→month→week ancestor chain, then add a
-        cross-reference edge from release (xref_id) to the week node.
-
-        wk iterates as week→month→year→decade; reversed() gives root-first
-        order so each child's parent is always inserted before it.
-        """
-        key     = f"{wk.get('chart_slug','')}/{wk.get('date','')}"
-        prev_id = root_id      # first spine node hangs off the timeline root
-
-        for spine_node in reversed(wk):
-            _register(spine_node)
-            nid = id(spine_node)
-            if nid not in seen_spine:
-                seen_spine.add(nid)
-                info = _node_info(spine_node)
-                info["parent_id"] = prev_id
-                if not getattr(spine_node, "auto_expand", False):
-                    info["pre_visited"] = True
-                if spine_node is wk:
-                    info["run_length"] = run_lengths.get(key, 1)
-                children.append(info)
-            prev_id = nid
-
-        # Cross-reference: visual edge from the release to its chart week
-        xref = _node_info(wk)
-        xref["parent_id"]  = xref_id
-        xref["run_length"] = run_lengths.get(key, 1)
-        if not getattr(wk, "auto_expand", False):
-            xref["pre_visited"] = True
-        children.append(xref)
-
+        _bfs._broadcast({"type": "error", "node_id": node_id, "error": "Node not found"})
+        return
     try:
-        for child in node.stream():
+        for child in node:
+            if gen != -1 and gen != _bfs._gen:
+                return          # reset happened mid-iteration; stop broadcasting
             _register(child)
-
-            if isinstance(child, TemporalMixin) and isinstance(node, ReleaseNode):
-                # release.stream() yields WeekNodes — wire them into the spine
-                _add_week_spine(child, node_id, node.get("run_lengths") or {})
-            else:
-                info = _node_info(child)
-                info["parent_id"] = node_id
-                if not getattr(child, "auto_expand", False):
-                    info["pre_visited"] = True
-                children.append(info)
-
+            info = _node_info(child)
+            info["parent_id"] = node_id
+            _bfs._broadcast({"type": "node", **info})
     except Exception as exc:
-        error = str(exc)
-
-    # Propagate any error/status the node itself recorded (e.g. HTTP 429)
-    if not error and callable(getattr(node, "get", None)):
-        error = node.get("error", "") or ""
-    status = (node.get("status", "") if callable(getattr(node, "get", None)) else "") or "done"
-
-    # Cascade: server-side push of auto-expand children back onto the BFS queue.
-    # No-op for pre_visited children, when stopped, or when gen is stale (reset happened).
-    for c in children:
-        if not c.get("pre_visited"):
-            _bfs.push(c["id"], gen=gen)
-
-    return {
-        "node_id":  node_id,
-        "label":    _label(node),
-        "children": children,
-        "status":   status,
-        "error":    error,
-    }
+        import traceback; traceback.print_exc()
+        _bfs._broadcast({"type": "error", "node_id": node_id, "error": str(exc)})
+    # Broadcast the expanded node's updated status so the browser can mark it
+    # as visited and reflect the new status, even when there are no children.
+    has_get = callable(getattr(node, "get", None))
+    status  = node.get("status", "") if has_get else ""
+    label   = node.get("label",  "") if has_get else str(node_id)
+    if not label and has_get:
+        label = getattr(node, "label", "") or ""
+    ev = {"type": "expanded", "id": node_id, "status": status, "label": label}
+    if status == "error":
+        ev["error"] = node.get("error", "")
+        ev["trace"] = node.get("error_trace", "")
+    _bfs._broadcast(ev)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -377,42 +326,19 @@ class BFSManager:
                 self._in_flight += 1
 
             try:
-                gen    = self._gen                 # capture before expansion
-                result = _expand_node(node_id, self._root_id, gen=gen)
-
-                # Stale worker — a reset happened while we were expanding.
-                # Drop the result; the client has moved on.
-                if gen != self._gen:
-                    with self._flight_lock:
-                        self._in_flight -= 1
-                    continue
-
-                self._broadcast({"type": "expand", **result})
-
+                gen = self._gen
+                _expand_node(node_id, gen)
+            finally:
                 queued = self._queue.qsize()
                 with self._flight_lock:
                     self._in_flight -= 1
                     in_flight = self._in_flight
 
                 if queued == 0 and in_flight == 0:
-                    # All workers are idle and nothing is left to process
                     self._broadcast({"type": "done", "queued": 0})
                 else:
-                    self._broadcast({
-                        "type":   "status",
-                        "msg":    f"Expanding {result['label']}…",
-                        "queued": queued,
-                    })
+                    self._broadcast({"type": "status", "queued": queued})
 
-            except Exception as exc:
-                with self._flight_lock:
-                    self._in_flight -= 1
-                self._broadcast({
-                    "type": "expand", "node_id": node_id,
-                    "label": "?", "children": [],
-                    "status": "error", "error": str(exc),
-                })
-            finally:
                 self._queue.task_done()
 
 
@@ -427,6 +353,19 @@ _bfs = BFSManager()
 _root: Timeline | None = None
 
 
+def _chain_notify(node, parent_id: int | None) -> None:
+    """Register a parent-chain node and broadcast it to SSE clients.
+
+    Called from model._check_parents() when a new ancestor node is created
+    during bottom-up chain assembly (e.g. a ChartNode creating its MonthNode).
+    """
+    _register(node)
+    info = _node_info(node)
+    if parent_id is not None:
+        info["parent_id"] = parent_id
+    _bfs._broadcast({"type": "node", **info})
+
+
 def _init() -> Timeline:
     """
     Tear down all node registries, reset the BFS manager, and create a
@@ -437,14 +376,15 @@ def _init() -> Timeline:
     otherwise the client must POST /explore/<root_id> to begin.
     """
     global _root
-    for cls in (Timeline, DecadeNode, YearNode, MonthNode, WeekNode, ArtistNode, ReleaseNode):
+    for cls in (Timeline, DecadeNode, YearNode, MonthNode, ChartNode, ArtistNode, ReleaseNode):
         cls.clear_registry()
     with _registry_lock:
         _node_registry.clear()
     _bfs.reset()
+    model.set_manager(_bfs, _chain_notify)
     _root = Timeline.get_or_create("timeline", {})
     _register(_root)
-    _bfs._root_id = id(_root)    # workers use this to anchor the temporal spine
+    _bfs._root_id = id(_root)
     return _root
 
 
@@ -632,7 +572,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(200, {"artists": []}); return
         try:
             import json as _json
-            raw  = model.ChartNode._fetch_raw(model.ChartNode._SUGGEST_BASE + urllib.parse.quote_plus(terms))
+            raw  = model.BaseNode._fetch_raw(model.BaseNode._SUGGEST_BASE + urllib.parse.quote_plus(terms))
             data = _json.loads(raw)
             out  = []
             for a in data.get("results", {}).get("artist", [])[:8]:

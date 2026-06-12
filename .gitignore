@@ -1,14 +1,15 @@
+
 __pycache__/
+.DS_Store
+.venv/
+*.db
+*.db-shm
+*.db-wal
+*.egg-info/
 *.pyc
 *.pyo
-.venv/
-venv/
-*.egg-info/
-dist/
-build/
-.DS_Store
-
 # SQLite cache files — local only, may contain copyrighted data
-*.db
-*.db-wal
-*.db-shm
+build/
+charts.db
+dist/
+venv/

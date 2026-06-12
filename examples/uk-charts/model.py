@@ -6,18 +6,18 @@
 ## ---------
 ## The graph has two distinct structural zones:
 ##
-##   Tree spine (Timeline → Decade → Year → Month → Week)
+##   Time tree (Timeline → Decade → Year → Month → Chart)
 ##     Each node has exactly one parent.  No shared references, no cycles.
 ##     GraphMixin is inherited for get_or_create convenience, but $ref
 ##     serialisation never fires here.
 ##
 ##   Graph (Week → Release ↔ Artist)
-##     WeekNodes are referenced from both their MonthNode and from
+##     ChartNodes are referenced from both their MonthNode and from
 ##     ReleaseNode.chart_weeks.  ReleaseNodes are referenced from both
-##     WeekNodes and ArtistNodes.  This is where graph identity matters
+##     ChartNodes and ArtistNodes.  This is where graph identity matters
 ##     and $ref serialisation keeps snapshots correct.
 ##
-## All node classes inherit ChartNode, which wires together the full
+## All node classes inherit BaseNode, which wires together the full
 ## node-x mixin stack (DBMixin, GraphMixin, Serialisable, StreamMixin
 ## and the app-level RenderMixin, PhysicsMixin, GraphBehavior).
 ##
@@ -30,13 +30,14 @@ import math
 import re
 import sys
 import threading
+import traceback
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, timedelta
 from pathlib import Path
-from typing import ClassVar, Iterator
+from typing import ClassVar
 
 for _p in (
     Path(__file__).parent,
@@ -53,11 +54,27 @@ from node_x.node_x_sqlite import DBMixin
 # identical to pre-cache code.  Set via set_node_db() at startup.
 _db = None
 
+# Expansion manager and notification callback — injected by server.py at
+# startup.  _notify(node, parent_id) registers the node and broadcasts it.
+# _manager must have a push(node_id) method to queue a node for expansion.
+_manager = None
+_notify  = None
+
+# Per-node fetch locks prevent two worker threads from simultaneously running
+# fetch_timeline() on the same ReleaseNode (race: both see _chart_runs is None).
+
 
 def set_node_db(db) -> None:
     """Point the model at a NodeDB instance for cache-aside reads and writes."""
     global _db
     _db = db
+
+
+def set_manager(mgr, notify_fn) -> None:
+    """Inject the BFS manager and SSE notification callback from server.py."""
+    global _manager, _notify
+    _manager = mgr
+    _notify  = notify_fn
 
 
 def _log(symbol: str, label: str, key: str) -> None:
@@ -87,7 +104,7 @@ def _related_artists(name: str) -> list[dict]:
         return []
     try:
         import json as _json
-        data    = _json.loads(ChartNode._fetch_raw(ChartNode._SUGGEST_BASE + urllib.parse.quote_plus(name)))
+        data    = _json.loads(BaseNode._fetch_raw(BaseNode._SUGGEST_BASE + urllib.parse.quote_plus(name)))
         artists = data.get("results", {}).get("artist", [])
         out = []
         for a in artists[:6]:
@@ -111,7 +128,7 @@ def _first_chart_date_of_month(year: int, month: int, slug: str) -> "date | None
     while d.weekday() != 6:
         d += timedelta(days=1)
     try:
-        html   = ChartNode._fetch(f"/charts/{slug}/{d.strftime('%Y%m%d')}/")
+        html   = BaseNode._fetch(f"/charts/{slug}/{d.strftime('%Y%m%d')}/")
         # The site redirects to the nearest real publication date; read it from
         # the canonical link rather than trusting the URL we requested.
         can_m  = _CANONICAL_RE.search(html)
@@ -215,8 +232,8 @@ def _chart_runs(entries: list[dict]) -> list[dict]:
     return runs
 
 
-def make_path_from(date_str: str, slug: str) -> "WeekNode":
-    """Create every node from DecadeNode down to WeekNode without triggering any stream."""
+def make_path_from(date_str: str, slug: str) -> "ChartNode":
+    """Create every node from DecadeNode down to ChartNode without triggering any stream."""
     d      = date.fromisoformat(date_str)
     decade = (d.year // 10) * 10
     DecadeNode.get_or_create(str(decade), {"decade": decade})
@@ -224,13 +241,13 @@ def make_path_from(date_str: str, slug: str) -> "WeekNode":
     month_node = MonthNode.get_or_create(f"{d.year}-{d.month:02d}", {
         "year": d.year, "month": d.month, "month_name": MONTH_NAMES[d.month - 1],
     })
-    wk = WeekNode.get_or_create(f"{slug}/{date_str}", {
+    wk = ChartNode.get_or_create(f"{slug}/{date_str}", {
         "date": date_str, "chart_slug": slug,
         "label": f"New Entries {d.strftime('%d %b %Y')}",
     })
     weeks = month_node.get("weeks")
     if weeks is None:
-        weeks = WeekList()
+        weeks = ChartList()
         month_node["weeks"] = weeks
     if wk not in weeks:
         weeks.append(wk)  # release may chart in a week MonthNode hasn't streamed yet
@@ -262,7 +279,7 @@ def _parse_artist_html(html: str) -> list[dict]:
 class DecadeList(SerialisableNodeList["DecadeNode"]):         pass
 class YearList(SerialisableNodeList["YearNode"]):             pass
 class MonthList(SerialisableNodeList["MonthNode"]):           pass
-class WeekList(SerialisableNodeList["WeekNode"]):             pass
+class ChartList(SerialisableNodeList["ChartNode"]):             pass
 class ReleaseList(SerialisableNodeList["ReleaseNode"]):       pass
 
 
@@ -274,25 +291,6 @@ MONTH_NAMES = [
     "January", "February", "March", "April", "May", "June",
     "July", "August", "September", "October", "November", "December",
 ]
-
-
-# ---------------------------------------------------------------------------
-# GraphBehavior
-# ---------------------------------------------------------------------------
-
-class GraphBehavior:
-    ## @brief Mixin: graph-level operational flags carried by every node class.
-    ##
-    ## Flags here govern how the server handles the node in the graph — whether
-    ## it participates in BFS auto-expansion, whether it is searchable, etc.
-    ## The server reads these via getattr so adding a new flag to this mixin
-    ## is sufficient; no server-side dispatch table needs updating.
-    ##
-    ## Default is False for all flags — nodes opt in by overriding at class level.
-
-    auto_expand = False
-    ## @brief When True the server expands this node automatically without
-    ##        waiting for a user click.
 
 
 # ---------------------------------------------------------------------------
@@ -346,39 +344,18 @@ class PhysicsMixin:
 
 
 # ---------------------------------------------------------------------------
-# TemporalMixin
-# ---------------------------------------------------------------------------
-
-class TemporalMixin:
-    """Mixin for nodes in the time spine.
-
-    Iterating a temporal node yields self then each ancestor in turn
-    (week → month → year → decade).  Reversing that gives root-first
-    order (decade → year → month → week), which is exactly what the
-    server needs to build parent_id chains without any knowledge of the
-    temporal structure.
-    """
-
-    def __iter__(self):
-        yield self
-        if callable(getattr(self, "parents", None)):
-            for parent in self.parents():
-                if isinstance(parent, TemporalMixin):
-                    yield from parent
-
-    def __reversed__(self):
-        return reversed(list(self))
-
-
-# ---------------------------------------------------------------------------
 # Composite base classes
 # ---------------------------------------------------------------------------
 
-class ChartNode(DBMixin, GraphBehavior, RenderMixin, PhysicsMixin, GraphMixin, Serialisable, StreamMixin, Node):
+class BaseNode(DBMixin, RenderMixin, PhysicsMixin, GraphMixin, Serialisable, StreamMixin, Node):
     ## @brief Base for every serialisable, graph-registered chart node.
     ##
     ## Combines the full mixin stack so subclasses declare only what makes
     ## them distinct.
+
+    auto_expand = False
+    ## @brief When True the server expands this node automatically without
+    ##        waiting for a user click.  False by default — nodes opt in.
 
     # ── Network ───────────────────────────────────────────────────────────────
     BASE_URL     = "https://www.officialcharts.com"
@@ -406,7 +383,7 @@ class ChartNode(DBMixin, GraphBehavior, RenderMixin, PhysicsMixin, GraphMixin, S
                 cls._registry[key] = hit
                 return hit
         node = super().get_or_create(key, data)
-        # Save a stub so any node is findable in DB before its stream() is called.
+        # Save a stub so any node is findable in DB before it is expanded.
         # Guard on the primary children field prevents redundant saves once populated.
         children = getattr(cls, "_children", ())
         if _db is not None and (not children or node.get(children[0]) is None):
@@ -427,7 +404,7 @@ class ChartNode(DBMixin, GraphBehavior, RenderMixin, PhysicsMixin, GraphMixin, S
                 gap = cls._MIN_GAP - (time.monotonic() - cls._last_req)
                 if gap > 0:
                     time.sleep(gap)
-                ChartNode._last_req = time.monotonic()
+                BaseNode._last_req = time.monotonic()
             for attempt in range(4):
                 try:
                     with urllib.request.urlopen(req, timeout=20) as r:
@@ -462,11 +439,52 @@ class ChartNode(DBMixin, GraphBehavior, RenderMixin, PhysicsMixin, GraphMixin, S
         ## are needed.
         return {}
 
-    def stream(self, _data=None):
+    def _parent_specs(self) -> list:
+        """Return [(cls, key, data), ...] for each parent this node should have.
+
+        BaseNode has no parents; temporal subclasses override this.
+        """
+        return []
+
+    def _check_parents(self) -> None:
+        """Create any missing parent nodes, notify the server, and queue for expansion."""
+        if _notify is None:
+            return
+        for cls, key, data in self._parent_specs():
+            existed = "_registry" in cls.__dict__ and key in cls._registry
+            parent  = cls.get_or_create(key, data)
+            if not existed:
+                parent._check_parents()
+                parent._db_save()
+                # After the recursive call, parent's own parents are in their
+                # registries — look up the first one to get the broadcast parent_id.
+                parent_id = None
+                for p_cls, p_key, _ in parent._parent_specs():
+                    reg = p_cls.__dict__.get("_registry", {})
+                    if p_key in reg:
+                        parent_id = id(reg[p_key])
+                        break
+                _notify(parent, parent_id)
+                if parent.auto_expand and _manager is not None:
+                    _manager.push(id(parent))
+
+    def __iter__(self):
+        # Lifecycle wrapper: cache check → stream() → accumulate → save → yield.
+        # Subclasses override stream() with their own child-generation logic.
+        self._check_parents()
         field = self._children[0] if self._children else None
         if not field:
             return
         cached = self.get(field)
+        if cached is None and _db is not None:
+            _rk = self.get("_key", "")
+            if _rk:
+                _hit = type(self).db_load(_rk, _db)
+                if _hit is not None:
+                    _c = _hit.get(field)
+                    if _c is not None:
+                        self[field] = _c
+                        cached = _c
         if cached is not None:
             self["status"] = self._status_cached
             _log("●", type(self).__name__, self.get("_key", ""))
@@ -477,31 +495,21 @@ class ChartNode(DBMixin, GraphBehavior, RenderMixin, PhysicsMixin, GraphMixin, S
         self["status"] = "fetching"
         _log("↓", type(self).__name__, self.get("_key", ""))
         try:
-            for child in self.populate_self():
+            for child in self.stream():
                 children.append(child)
                 yield child
             self[field] = children
             self["status"] = self._status_fetched
             self._db_save()
         except Exception as exc:
-            self["status"] = "error"
-            self["error"]  = str(exc)
-
-    def populate_self(self):
-        # Subclasses override this to yield their children.
-        # stream() wraps it with cache check, status, logging, save, and error handling.
-        return iter([])
+            self["status"]      = "error"
+            self["error"]       = str(exc)
+            self["error_trace"] = traceback.format_exc()
+            _log("!", "ERROR", f"{type(self).__name__} {self.get('_key', '')} — {exc}")
+            print(self["error_trace"], flush=True)
 
 
-class TemporalChartNode(TemporalMixin, ChartNode):
-    ## @brief Base for nodes that live on the time spine (decade → week).
-    ##
-    ## Adds ``TemporalMixin`` iteration so the server can walk the spine
-    ## root-first without knowing which level a node occupies.
-    pass
-
-
-class Timeline(ChartNode):
+class Timeline(BaseNode):
     """Single root node. Streams DecadeNodes newest-first. The natural snapshot root for the whole graph."""
     _children: ClassVar[tuple] = ("decades",)
     _restore_via_payload = True
@@ -511,7 +519,7 @@ class Timeline(ChartNode):
     child_spread  = 100
     charge        = -60     ## @brief Strong repulsion keeps decades from stacking on the root.
 
-    def populate_self(self):
+    def stream(self):
         today = date.today()
         end   = (today.year // 10) * 10
         start = (_FIRST_CHART_YEAR // 10) * 10
@@ -519,7 +527,7 @@ class Timeline(ChartNode):
             yield DecadeNode.get_or_create(str(d), {"decade": d})
 
 
-class DecadeNode(TemporalChartNode):
+class DecadeNode(BaseNode):
     """A decade. Streams YearNodes. GraphMixin-keyed so it can be found from any direction."""
     _children: ClassVar[tuple] = ("years",)
     _restore_via_payload = True
@@ -538,14 +546,17 @@ class DecadeNode(TemporalChartNode):
     child_spread  = 80
     charge        = -40
 
-    def populate_self(self):
+    def _parent_specs(self) -> list:
+        return [(Timeline, "timeline", {})]
+
+    def stream(self):
         decade = self["decade"]
         today  = date.today()
         for y in range(min(decade + 9, today.year), max(decade, _FIRST_CHART_YEAR) - 1, -1):
             yield YearNode.get_or_create(str(y), {"year": y})
 
 
-class YearNode(TemporalChartNode):
+class YearNode(BaseNode):
     """A calendar year. Streams MonthNodes downward; parents() links up to its DecadeNode."""
     _children: ClassVar[tuple] = ("months",)
     _restore_via_payload = True
@@ -564,11 +575,11 @@ class YearNode(TemporalChartNode):
     child_spread  = 80
     charge        = -30
 
-    def parents(self) -> Iterator["DecadeNode"]:
+    def _parent_specs(self) -> list:
         decade = (self["year"] // 10) * 10
-        yield DecadeNode.get_or_create(str(decade), {"decade": decade})
+        return [(DecadeNode, str(decade), {"decade": decade})]
 
-    def populate_self(self):
+    def stream(self):
         year       = self["year"]
         today      = date.today()
         last_month = today.month if today.year == year else 12
@@ -578,8 +589,8 @@ class YearNode(TemporalChartNode):
             })
 
 
-class MonthNode(TemporalChartNode):
-    """A calendar month. Streams WeekNodes downward; parents() links up to its YearNode."""
+class MonthNode(BaseNode):
+    """A calendar month. Streams ChartNodes downward; parents() links up to its YearNode."""
     _children: ClassVar[tuple] = ("weeks",)
     _restore_via_payload = True
     node_colour   = "#c0392b"
@@ -599,10 +610,11 @@ class MonthNode(TemporalChartNode):
     child_spread  = 80
     charge        = -25
 
-    def parents(self) -> Iterator["YearNode"]:
-        yield YearNode.get_or_create(str(self["year"]), {"year": self["year"]})
+    def _parent_specs(self) -> list:
+        year = self["year"]
+        return [(YearNode, str(year), {"year": year})]
 
-    def populate_self(self):
+    def stream(self):
         year  = self["year"]
         month = self["month"]
         today = date.today()
@@ -611,14 +623,14 @@ class MonthNode(TemporalChartNode):
             if d is None:
                 continue
             while d.month == month and d <= today:
-                yield WeekNode.get_or_create(f"{slug}/{d.isoformat()}", {
+                yield ChartNode.get_or_create(f"{slug}/{d.isoformat()}", {
                     "date":       d.isoformat(),
                     "chart_slug": slug,
                 })
                 d += timedelta(weeks=1)
 
 
-class WeekNode(TemporalChartNode):
+class ChartNode(BaseNode):
     """One weekly chart. Fetches entries downward; parents() links up to its MonthNode."""
     _children: ClassVar[tuple] = ("releases",)
     _restore_via_payload = True
@@ -637,18 +649,18 @@ class WeekNode(TemporalChartNode):
     node_colour   = "#3949ab"
     node_radius   = 5
     target_radius = 80
-    link_strength = 0.45    ## @brief Weaker than the spine — weeks are leaf nodes on the temporal chain.
+    link_strength = 0.45    ## @brief Weaker than month — charts are leaf nodes of the time tree.
     child_spread  = 80
     charge        = -20
 
-    def parents(self) -> Iterator["MonthNode"]:
+    def _parent_specs(self) -> list:
         d_obj = date.fromisoformat(self["date"])
-        yield MonthNode.get_or_create(f"{d_obj.year}-{d_obj.month:02d}", {
+        return [(MonthNode, f"{d_obj.year}-{d_obj.month:02d}", {
             "year": d_obj.year, "month": d_obj.month,
             "month_name": MONTH_NAMES[d_obj.month - 1],
-        })
+        })]
 
-    def populate_self(self):
+    def stream(self):
         dt   = self["date"].replace("-", "")
         slug = self["chart_slug"]
         for e in _parse_week_html(self._fetch(f"/charts/{slug}/{dt}/")):
@@ -665,7 +677,7 @@ class WeekNode(TemporalChartNode):
             })
 
 
-class ArtistNode(ChartNode):
+class ArtistNode(BaseNode):
     """An artist. Fetches discography, streams ReleaseNodes for the active chart type."""
     _children: ClassVar[tuple] = ("releases",)
     _restore_via_payload = True
@@ -684,7 +696,7 @@ class ArtistNode(ChartNode):
     child_spread  = 300     ## @brief Large scatter so releases don't spawn on top of each other.
     charge        = -20
 
-    def stream(self, _data=None):
+    def __iter__(self):
         if self.get("name", "").lower() == "various artists" or not self.get("artist_path"):
             return
         # is_known prevents re-expansion of the same artist within one session
@@ -694,13 +706,13 @@ class ArtistNode(ChartNode):
             return
         fresh = self.get("releases") is None  # capture before mark_known/super may set it
         self.mark_known()
-        yield from super().stream()
+        yield from super().__iter__()
         if fresh:
             # Related artist suggestions are ephemeral — not stored in releases,
             # not saved to DB, only yielded on the first live fetch.
             yield from self._yield_related()
 
-    def populate_self(self):
+    def stream(self):
         path   = self.get("artist_path", "")
         target = set(_chart_slugs)
         count  = 0
@@ -737,8 +749,8 @@ class ArtistNode(ChartNode):
             yield from _suggestions(part)
 
 
-class ReleaseNode(ChartNode):
-    """A charting release. Wires itself into the time spine on first discovery; streams its artist."""
+class ReleaseNode(BaseNode):
+    """A charting release. Links to its chart on first discovery; streams its artist."""
     _children: ClassVar[tuple] = ("artist_node", "chart_weeks")
     _restore_via_payload = True
 
@@ -770,18 +782,15 @@ class ReleaseNode(ChartNode):
     charge        = -20
 
     def fetch_timeline(self) -> None:
-        """Fetch the full chart run and populate chart_weeks. Idempotent."""
-        if self.get("chart_weeks") is not None:
+        """Fetch chart run data into run_lengths. Idempotent."""
+        if self.get("run_lengths") is not None:
             return
-        # get_or_create checks DB on a registry miss, but a node created earlier
-        # in the same session stays in the registry as a stub.  Check DB here so
-        # a previously saved timeline is not re-fetched over the network.
         if _db is not None:
             _rk = self.get("_key") or self.get("song_path") or self.get("path", "")
             if _rk:
                 _cached_r = _db.load(ReleaseNode, _rk)
-                if _cached_r is not None and _cached_r.get("chart_weeks") is not None:
-                    for _f in ("chart_weeks", "run_lengths", "peak_position",
+                if _cached_r is not None and _cached_r.get("run_lengths") is not None:
+                    for _f in ("run_lengths", "peak_position",
                                "total_weeks", "chart_from", "chart_to", "chart_score"):
                         _v = _cached_r.get(_f)
                         if _v is not None:
@@ -796,20 +805,13 @@ class ReleaseNode(ChartNode):
         self["status"] = "fetching"
         try:
             all_entries = _parse_release_html(self._fetch(release_path))
-            # Only process entries for the active chart type(s).
             target  = set(_chart_slugs)
             entries = [e for e in all_entries if e["chart_slug"] in target]
-            runs = _chart_runs(entries)
-            chart_weeks = WeekList()
+            runs    = _chart_runs(entries)
             rl = Node()
-            for run in runs:
-                wk = make_path_from(run["date"], run["chart_slug"])
-                chart_weeks.append(wk)
-                # Key uses the normalised date so it matches add_week_spine's lookup.
-                rl[f"{run['chart_slug']}/{wk['date']}"] = run["run_length"]
-            self["chart_weeks"] = chart_weeks
+            for r in runs:
+                rl[f"{r['chart_slug']}/{r['date']}"] = r["run_length"]
             self["run_lengths"] = rl
-            # Chart stats for tooltip + visual weight
             if entries:
                 positions = [e["position"] for e in entries if 0 < e["position"] <= 100]
                 dates     = sorted(e["date"] for e in entries)
@@ -817,16 +819,40 @@ class ReleaseNode(ChartNode):
                 self["total_weeks"]   = len(entries)
                 self["chart_from"]    = dates[0]  if dates else ""
                 self["chart_to"]      = dates[-1] if dates else ""
-                # log-weighted score: rewards high positions AND longevity
                 self["chart_score"]   = sum(math.log(102 - p) for p in positions)
             self["status"] = self._status_fetched
             self._db_save()
         except Exception as exc:
-            self["status"] = "error"
-            self["error"]  = str(exc)
+            self["status"]      = "error"
+            self["error"]       = str(exc)
+            self["error_trace"] = traceback.format_exc()
+            _log("!", "ERROR", f"{self.get('_key', '')} — {exc}")
+            print(self["error_trace"], flush=True)
 
-    def stream(self, _data=None):
+    def _parent_specs(self) -> list:
+        rl = self.get("run_lengths")
+        if not rl:
+            return []
+        return [
+            (ChartNode, key, {
+                "date": key.split("/")[1],
+                "chart_slug": key.split("/")[0],
+            })
+            for key in rl
+        ]
+
+    def __iter__(self):
         self.fetch_timeline()
+        self._check_parents()
+        if not self.get("chart_weeks"):
+            chart_weeks = ChartList()
+            for key in (self.get("run_lengths") or {}):
+                slug, dt = key.split("/", 1)
+                chart_weeks.append(ChartNode.get_or_create(key, {
+                    "date": dt, "chart_slug": slug,
+                }))
+            self["chart_weeks"] = chart_weeks
+            self._db_save()
         # Artist
         if not self.get("artist_node"):
             artist_path = self.get("artist_path", "")
@@ -838,7 +864,7 @@ class ReleaseNode(ChartNode):
                 self["artist_node"] = al
         if self.get("artist_node"):
             yield from self["artist_node"]
-        # Reverse chain: all weeks this release charted in
+        # Reverse chain: all chart weeks this release appeared in
         yield from (self.get("chart_weeks") or [])
 
 
@@ -854,14 +880,15 @@ class ReleaseNode(ChartNode):
 Timeline._list_fields   = {"decades":  (DecadeList,           DecadeNode)}
 DecadeNode._list_fields = {"years":    (YearList,             YearNode)}
 YearNode._list_fields   = {"months":   (MonthList,            MonthNode)}
-MonthNode._list_fields  = {"weeks":    (WeekList,             WeekNode)}
-WeekNode._list_fields   = {"releases": (ReleaseList,          ReleaseNode)}
+MonthNode._list_fields  = {"weeks":    (ChartList,             ChartNode)}
+ChartNode._list_fields   = {"releases": (ReleaseList,          ReleaseNode)}
 ArtistNode._list_fields = {"releases": (ReleaseList,          ReleaseNode)}
 
-# ReleaseNode has two list children and one plain-Node child.
-# WeekNode and ArtistNode are both defined by this point so no forward refs.
+# ReleaseNode has two list children. run_lengths is stored as a plain dict in
+# the snapshot (written by _from_payload via dict.__init__) so it does not
+# need a _node_fields entry — Node has no restore() and the plain dict works
+# for all the iteration/lookup code that consumes run_lengths.
 ReleaseNode._list_fields = {
-    "chart_weeks": (WeekList,             WeekNode),
+    "chart_weeks": (ChartList,             ChartNode),
     "artist_node": (SerialisableNodeList, ArtistNode),
 }
-ReleaseNode._node_fields = {"run_lengths": Node}
