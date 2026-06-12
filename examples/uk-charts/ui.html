@@ -33,9 +33,9 @@
     <div id="search-results"></div>
   </div>
   <div class="chart-toggle">
-    <button id="tog-albums"  class="active" onclick="setChart('albums')">Albums</button>
+    <button id="tog-albums"             onclick="setChart('albums')">Albums</button>
     <button id="tog-singles"            onclick="setChart('singles')">Singles</button>
-    <button id="tog-both"               onclick="setChart('both')">Both</button>
+    <button id="tog-both"  class="active" onclick="setChart('both')">Both</button>
   </div>
   <button id="pause-btn" class="tb-btn" onclick="togglePause()">Pause</button>
   <button id="stop-btn"  class="tb-btn" onclick="stopCascade()">Stop</button>
@@ -56,7 +56,8 @@
     <div><span style="background:#CC8800"></span>decade</div>
     <div><span style="background:#FF6D00"></span>year</div>
     <div><span style="background:#E53935"></span>month</div>
-    <div><span style="background:#5c6bc0"></span>week</div>
+    <div><span style="background:#3949ab"></span>albums week</div>
+    <div><span style="background:#6a1b9a"></span>singles week</div>
     <div><span style="background:#4CAF50"></span>artist</div>
     <div><span style="background:#A5D6A7"></span>album</div>
     <div><span style="background:#80DEEA"></span>single</div>
@@ -104,8 +105,6 @@ const colour = d => {
 // the server) so changing the mixin value takes effect on next expansion.
 const radius = d => {
   if (typeof d === "string") return Prefs.get("nodePhysics", d)?.node_radius || 6;
-  if (d.node_type === "release" && d.chart_score > 0)
-    return Math.max(5, Math.min(22, 4 + Math.sqrt(d.chart_score) * 1.8));
   return d.node_radius || 6;
 };
 
@@ -297,7 +296,13 @@ function _attachHandlers(sel) {
       e.stopPropagation();
       if (this._dragged) return;
 
-      _postExplore(d.id);
+      const nextCount = (d._clickCount || 0) + 1;
+      const frontier = nextCount === 1
+        ? [d.id]
+        : _bfsToDepth(d.id, nextCount - 1);
+      if (frontier.length === 0) return;  // graph not ready yet — wait and click again
+      d._clickCount = nextCount;
+      for (const id of frontier) _postExplore(id);
     })
     .on("mousemove",  (e, d) => showTip(e, d))
     .on("mouseleave", ()     => { tipEl.style.display = "none"; _tipNode = null; });
@@ -433,6 +438,11 @@ function _setupSSE() {
     sim.alpha(Math.max(sim.alpha(), SIM.nudgeAlpha)).restart();
   });
 
+  _sse.addEventListener("console", e => {
+    const data = JSON.parse(e.data);
+    if (data.msg === ".") conDot(); else conLog(data.msg);
+  });
+
   _sse.addEventListener("expanded", e => {
     const data = JSON.parse(e.data);
     if (data.label) actLog(data.label, data.status || "done");
@@ -463,6 +473,28 @@ function _setupSSE() {
 _setupSSE();
 
 // ── Server API wrappers ─────────────────────────────────────────────────────
+
+// BFS from rootId in gLinks, returning node IDs at exactly `depth` hops.
+function _bfsToDepth(rootId, depth) {
+  const visited = new Set([rootId]);
+  let frontier = [rootId];
+  for (let d = 0; d < depth; d++) {
+    const next = [];
+    for (const id of frontier) {
+      for (const link of gLinks) {
+        const srcId = link.source?.id ?? link.source;
+        const tgtId = link.target?.id ?? link.target;
+        if (srcId === id && !visited.has(tgtId)) {
+          visited.add(tgtId);
+          next.push(tgtId);
+        }
+      }
+    }
+    if (next.length === 0) return [];  // depth not yet reachable — don't fall back
+    frontier = next;
+  }
+  return frontier;
+}
 
 // POST to /explore/<id> — user-initiated node expansion.
 function _postExplore(nodeId) {
@@ -566,11 +598,24 @@ function updateQBar(queued = 0) { qBar.textContent = queued > 0 ? `${queued} que
 // ── Console panel ────────────────────────────────────────────────────────────
 
 const conLines = document.getElementById("console-lines");
+let _dotLine = null;  // current dot-accumulator element, or null
+
 function conLog(msg, cls = "info") {
+  _dotLine = null;  // next dot starts a fresh line
   const line = document.createElement("div");
   line.className = `con-line ${cls}`;
   line.textContent = msg;
   conLines.appendChild(line);
+  conLines.scrollTop = conLines.scrollHeight;
+}
+
+function conDot() {
+  if (!_dotLine) {
+    _dotLine = document.createElement("div");
+    _dotLine.className = "con-line cached";
+    conLines.appendChild(_dotLine);
+  }
+  _dotLine.textContent += ".";
   conLines.scrollTop = conLines.scrollHeight;
 }
 
@@ -643,7 +688,7 @@ function showTip(e, d) {
 
 // ── Chart mode toggle ───────────────────────────────────────────────────────
 
-let _chartMode = "albums";
+let _chartMode = "both";
 
 function setChart(mode) {
   if (mode === _chartMode) return;

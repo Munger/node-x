@@ -43,6 +43,7 @@ import argparse
 import json
 import queue
 import sys
+import time
 import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -64,7 +65,10 @@ _UI_FILE  = _HERE / "ui.html"
 _CSS_FILE = _HERE / "ui.css"
 
 # Concurrent BFS worker threads.
-_N_WORKERS = 4
+_N_WORKERS = 6
+
+# Per-worker generation tag — lets _chain_notify discard stale parent-chain broadcasts.
+_worker_tl = threading.local()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -141,30 +145,19 @@ def _node_info(node) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _expand_node(node_id: int, gen: int = -1) -> None:
-    """
-    Iterate node_id and broadcast each child to SSE clients as it is created.
-
-    The iteration does the work — parent chains are built, nodes are registered,
-    each child is broadcast immediately.  Nothing is returned; the SSE stream
-    is the result.
-    """
+    """Iterate node_id; each child is added to the canvas via BaseNode.add_to_canvas."""
     node = _lookup(node_id)
     if node is None:
         _bfs._broadcast({"type": "error", "node_id": node_id, "error": "Node not found"})
         return
     try:
-        for child in node:
+        for _ in node:
             if gen != -1 and gen != _bfs._gen:
-                return          # reset happened mid-iteration; stop broadcasting
-            _register(child)
-            info = _node_info(child)
-            info["parent_id"] = node_id
-            _bfs._broadcast({"type": "node", **info})
+                return          # reset happened mid-iteration; stop
     except Exception as exc:
         import traceback; traceback.print_exc()
         _bfs._broadcast({"type": "error", "node_id": node_id, "error": str(exc)})
-    # Broadcast the expanded node's updated status so the browser can mark it
-    # as visited and reflect the new status, even when there are no children.
+    # Broadcast updated status so the browser can mark the node as visited.
     has_get = callable(getattr(node, "get", None))
     status  = node.get("status", "") if has_get else ""
     label   = node.get("label",  "") if has_get else str(node_id)
@@ -208,13 +201,15 @@ class BFSManager:
         self._flight_lock  = threading.Lock()
         self._n_workers    = n_workers
         self._root_id      = 0                     # set by _init()
+        self._event_buf    = queue.Queue()         # workers push here; broadcaster forwards at rate
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        """Spawn N daemon worker threads.  Call once at process startup."""
+        """Spawn N daemon worker threads plus one broadcaster thread."""
         for _ in range(self._n_workers):
-            threading.Thread(target=self._worker, daemon=True).start()
+            threading.Thread(target=self._worker,     daemon=True).start()
+        threading.Thread(target=self._broadcaster, daemon=True).start()
 
     # ── Client subscription (one queue per SSE connection) ────────────────────
 
@@ -232,12 +227,39 @@ class BFSManager:
                 self._clients.remove(q)
             except ValueError:
                 pass
+            if not self._clients:
+                self.reset()    # last client left — invalidate in-flight work
 
     def _broadcast(self, event: dict) -> None:
-        """Push an event onto every connected SSE client's queue."""
-        with self._cli_lock:
-            for q in self._clients:
-                q.put(event)
+        """Enqueue an event for the broadcaster thread to forward to clients."""
+        self._event_buf.put(event)
+
+    def _broadcaster(self) -> None:
+        """Forward events from _event_buf to SSE clients at a controlled rate.
+
+        Drains up to 10 events per 20 ms so workers can run at full speed
+        while the browser receives a steady, digestible stream rather than a
+        sudden flood that overwhelms the D3 simulation.
+        """
+        while True:
+            # Block until at least one event is ready.
+            try:
+                first = self._event_buf.get(timeout=1)
+            except queue.Empty:
+                continue
+            batch = [first]
+            # Drain up to 9 more that are already queued (no extra wait).
+            for _ in range(9):
+                try:
+                    batch.append(self._event_buf.get_nowait())
+                except queue.Empty:
+                    break
+            with self._cli_lock:
+                clients = list(self._clients)
+            for event in batch:
+                for q in clients:
+                    q.put(event)
+            time.sleep(0.02)   # 20 ms between batches → ≤500 events/s
 
     # ── Queue control ─────────────────────────────────────────────────────────
 
@@ -327,6 +349,7 @@ class BFSManager:
 
             try:
                 gen = self._gen
+                _worker_tl.gen = gen
                 _expand_node(node_id, gen)
             finally:
                 queued = self._queue.qsize()
@@ -353,12 +376,20 @@ _bfs = BFSManager()
 _root: Timeline | None = None
 
 
-def _chain_notify(node, parent_id: int | None) -> None:
-    """Register a parent-chain node and broadcast it to SSE clients.
+def _console_log(msg: str) -> None:
+    """Broadcast a console message to all SSE clients."""
+    _bfs._broadcast({"type": "console", "msg": msg})
 
-    Called from model._check_parents() when a new ancestor node is created
-    during bottom-up chain assembly (e.g. a ChartNode creating its MonthNode).
+
+def _chain_notify(node, parent_id: int | None) -> None:
+    """_notify callback: register the node and broadcast it to SSE clients.
+
+    Called by BaseNode.add_to_canvas() via the _notify hook.  Handles the
+    gen check so stale workers don't pollute a freshly-loaded client.
     """
+    tl_gen = getattr(_worker_tl, "gen", -1)
+    if tl_gen != -1 and tl_gen != _bfs._gen:
+        return
     _register(node)
     info = _node_info(node)
     if parent_id is not None:
@@ -381,7 +412,7 @@ def _init() -> Timeline:
     with _registry_lock:
         _node_registry.clear()
     _bfs.reset()
-    model.set_manager(_bfs, _chain_notify)
+    model.set_manager(_bfs, _chain_notify, _console_log)
     _root = Timeline.get_or_create("timeline", {})
     _register(_root)
     _bfs._root_id = id(_root)

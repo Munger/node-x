@@ -262,10 +262,11 @@ svg { width: 100%; height: 100%; }
   line-height: 1.5;
 }
 
-.con-line       { color: #e0e0e0; white-space: pre-wrap; word-break: break-all; }
-.con-line.error { color: #ff6b6b; }
-.con-line.trace { color: #888; font-size: 10px; }
-.con-line.info  { color: #b0bec5; }
+.con-line        { color: #e0e0e0; white-space: pre-wrap; word-break: break-all; }
+.con-line.error  { color: #ff6b6b; }
+.con-line.trace  { color: #888; font-size: 10px; }
+.con-line.info   { color: #b0bec5; }
+.con-line.cached { color: #aaa; letter-spacing: 1px; }
 
 /* ── Queue depth indicator ────────────────────────────────────────────────── */
 

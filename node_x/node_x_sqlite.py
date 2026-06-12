@@ -146,25 +146,26 @@ class NodeDB:
     # Public API
     # -----------------------------------------------------------------------
 
-    def save(self, node: Any, key: Optional[str] = None) -> None:
-        ## @brief Persist a node's snapshot to the database.
+    def save(self, node: Any, key: Optional[str] = None, deep: bool = False) -> None:
+        ## @brief Persist a node's serialised record to the database.
         ##
         ## If *key* is omitted the node's ``_key`` payload field is used
         ## (set automatically by ``GraphMixin.get_or_create()``).  Raises
         ## ``ValueError`` if neither source provides a key.
         ##
-        ## The snapshot is produced by ``node.snapshot()``, serialised to
-        ## JSON, and stored with a ``saved_at`` Unix timestamp.  An existing
-        ## row for the same ``(class_name, key)`` is replaced atomically.
+        ## When *deep* is ``False`` (the default) the record is produced by
+        ## ``node.serialise()``, storing only the node's own scalar fields
+        ## with child nodes represented as plain key strings.  Pass
+        ## ``deep=True`` to store the full recursive subtree via
+        ## ``node.serialise(deep=True)`` (the former ``snapshot()`` behaviour).
         ##
         ## @param node  Any ``Serialisable`` node instance.
         ## @param key   Storage key; defaults to ``node["_key"]``.
+        ## @param deep  ``False`` (default) for a shallow per-node record;
+        ##              ``True`` for a full recursive snapshot.
         ## @raise ValueError  If no key can be determined.
-        ## @raise AttributeError  If *node* has no ``snapshot()`` method.
 
         if key is None:
-            # _key is set by GraphMixin.get_or_create(); plain nodes require
-            # the caller to supply a key explicitly.
             key = node.get("_key") if hasattr(node, "get") else None
         if not key:
             raise ValueError(
@@ -173,8 +174,9 @@ class NodeDB:
                 f"node carries _key in its payload."
             )
 
+        serialise = getattr(node, "serialise", None) or getattr(node, "snapshot", None)
         class_name = type(node).__qualname__
-        snap_json  = json.dumps(node.snapshot())
+        snap_json  = json.dumps(serialise(deep=deep) if serialise else {})
         conn       = self._connect()
         conn.execute(
             "INSERT OR REPLACE INTO snapshots "

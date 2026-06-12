@@ -517,38 +517,41 @@ class Node(dict):
         ## @brief Ensure *value* is safe to store in a Node payload.
         ##
         ## Allowed types: Node, NodeList, None, str, int, float, bool,
-        ## bytes, and tuple (recursively validated).
+        ## bytes, tuple, list, and dict (the latter two validated
+        ## recursively so their contents obey the same rules).
         ##
-        ## Raw ``list`` and ``dict`` are rejected — use ``NodeList``
-        ## or a ``Node`` subclass respectively.
+        ## Plain ``list`` and ``dict`` are permitted for storing inline
+        ## data records (e.g. a list of chart-position dicts).  They are
+        ## serialised correctly by ``to_plain()`` and restored verbatim
+        ## by ``_from_payload()``; ``_restore_children()`` only
+        ## reconstructs fields declared in ``_list_fields``/``_node_fields``
+        ## so plain data fields are never mistaken for child nodes.
         ##
-        ## Scalars are checked first as they are the most common payload
-        ## type.  Error cases (plain list, plain dict) are last.
+        ## Thread-safety note: the node's ``_lock`` protects assignment
+        ## of mutable values but not in-place mutation of the object once
+        ## stored.  Treat plain lists/dicts as write-once after storing.
+        ## A ``LockedList``/``LockedDict`` wrapper is a future enhancement.
         ##
         ## @param value  The value to check.
         ## @return None
-        ## @raise TypeError  If *value* is a plain list or dict.
+        ## @raise TypeError  If *value* is an unserializable Python object.
 
         if value is None or isinstance(value, (str, int, float, bool, bytes)):
             return
         if isinstance(value, (Node, NodeList)):
             return
-        if isinstance(value, tuple):
+        if isinstance(value, (tuple, list)):
             for item in value:
                 self._validate_value(item)
             return
-        if isinstance(value, list):
-            raise TypeError(
-                "Node cannot contain plain lists. Use NodeList instead."
-            )
         if isinstance(value, dict):
-            raise TypeError(
-                "Node cannot contain raw dicts. Wrap in a Node subclass."
-            )
+            for v in value.values():
+                self._validate_value(v)
+            return
         raise TypeError(
             f"Node cannot store {type(value).__name__}. "
             f"Allowed types: Node, NodeList, None, str, int, float, "
-            f"bool, bytes, tuple."
+            f"bool, bytes, tuple, list, dict."
         )
 
     def freeze(self, *, deep: bool = True) -> None:
@@ -1228,16 +1231,42 @@ class Serialisable:
 
         return json.dumps(self.to_plain(), indent=indent)
 
-    def snapshot(self) -> Any:
-        ## @brief Return a JSON-serialisable snapshot of this node tree.
+    def serialise(self, deep: bool = False) -> Any:
+        ## @brief Return a JSON-serialisable representation of this node.
         ##
-        ## Scalar fields are emitted first in insertion order, followed
-        ## by nested structures (dicts, lists).  This keeps snapshots
-        ## readable without requiring each subclass to define ordering.
+        ## When *deep* is ``True`` the full subtree is serialised
+        ## recursively (identical to the former ``snapshot()`` behaviour).
         ##
+        ## When *deep* is ``False`` (the default) only this node's own
+        ## fields are included.  Child ``Node`` values are replaced by
+        ## their plain ``_key`` string; child ``NodeList`` values become
+        ## a list of ``_key`` strings.  Nodes without a ``_key`` are
+        ## omitted.  This produces compact, non-redundant records suitable
+        ## for row-per-node database storage.
+        ##
+        ## Scalar fields are always emitted before nested structures so
+        ## that records remain human-readable.
+        ##
+        ## @param deep  ``True`` for a recursive deep snapshot,
+        ##              ``False`` (default) for a shallow own-fields record.
         ## @return Plain dict with scalars before nested structures.
 
-        plain = self.to_plain()
+        if deep:
+            plain = self.to_plain()
+        else:
+            plain = {}
+            with self._lock:
+                for k, v in self.items():
+                    if isinstance(v, Node):
+                        pass  # child nodes are stored separately
+                    elif isinstance(v, list) and any(isinstance(i, Node) for i in v):
+                        pass  # child lists are stored separately
+                    elif isinstance(v, dict):
+                        plain[k] = {dk: dv for dk, dv in v.items()
+                                    if not isinstance(dv, Node)}
+                    else:
+                        plain[k] = v
+
         if not isinstance(plain, dict):
             return plain
 
@@ -1251,6 +1280,14 @@ class Serialisable:
                 scalars[key] = value
 
         return {**scalars, **nested}
+
+    def snapshot(self) -> Any:
+        ## @brief Deep recursive snapshot of this node tree.
+        ##
+        ## Alias for ``serialise(deep=True)``.  Kept for backwards
+        ## compatibility — all existing callers continue to work unchanged.
+
+        return self.serialise(deep=True)
 
     @classmethod
     def restore(
@@ -1490,14 +1527,36 @@ class SerialisableNodeList(NodeList[T], Generic[T]):
     ## Provides the same serialisation interface as ``Serialisable``
     ## but for list-shaped collections of ``Node`` instances.
 
-    def snapshot(self) -> Any:
-        ## @return A list of plain dicts/scalars from each element's
-        ##         ``snapshot()`` method, falling back to identity for
-        ##         non-Node items.
+    def serialise(self, deep: bool = False) -> Any:
+        ## @brief Return a JSON-serialisable list of this collection.
+        ##
+        ## When *deep* is ``True`` each element is serialised in full via
+        ## its own ``serialise(deep=True)`` (or ``snapshot()`` for types
+        ## that have not yet been updated).
+        ##
+        ## When *deep* is ``False`` (the default) each element is replaced
+        ## by its plain ``_key`` string.  Elements without a ``_key`` are
+        ## omitted.
+        ##
+        ## @param deep  ``True`` for full recursive output, ``False`` for refs.
+        ## @return A plain list.
 
-        return [
-            getattr(item, "snapshot", lambda: item)() for item in self
-        ]
+        if deep:
+            return [
+                getattr(item, "serialise", getattr(item, "snapshot", lambda **_: item))(deep=True)
+                if callable(getattr(item, "serialise", None))
+                else getattr(item, "snapshot", lambda: item)()
+                for item in self
+            ]
+        return [item for item in self if not isinstance(item, Node)]
+
+    def snapshot(self) -> Any:
+        ## @brief Deep recursive snapshot of this list.
+        ##
+        ## Alias for ``serialise(deep=True)``.  Kept for backwards
+        ## compatibility.
+
+        return self.serialise(deep=True)
 
     @classmethod
     def restore(
