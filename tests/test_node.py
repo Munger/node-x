@@ -196,29 +196,18 @@ def run() -> Tuple[int, int]:
     # ------------------------------------------------------------------
     heading("Node: value validation")
     # ------------------------------------------------------------------
-    # _validate_value() enforces a strict whitelist.  Raw list and dict
-    # are rejected because they bypass the locking and type guarantees
-    # of NodeList and Node respectively.  Unknown types are also
-    # rejected.  Tuples are allowed but validated recursively — a tuple
-    # containing a list must still be rejected.  The error messages name
-    # the offending type and suggest the correct alternative so the
-    # developer does not need to look up the docs.
+    # _validate_value() enforces a strict whitelist.  Plain list and dict
+    # are permitted and validated recursively — their contents must still
+    # be valid node types.  Unknown types are rejected.  The error
+    # messages name the offending type so the developer knows what to fix.
 
-    msg = check_catch(passed, failed,
-                      "list raises TypeError",
-                      TypeError,
-                      lambda: Node().__setitem__("bad", [1, 2, 3]))
-    check(passed, failed,
-          "plain lists" in msg and "NodeList" in msg,
-          "list message says 'plain lists' and suggests NodeList")
-
-    msg = check_catch(passed, failed,
-                      "dict raises TypeError",
-                      TypeError,
-                      lambda: Node().__setitem__("bad", {"x": 1}))
-    check(passed, failed,
-          "raw dicts" in msg and "Node subclass" in msg,
-          "dict message says 'raw dicts' and suggests Node subclass")
+    # Plain list and dict are accepted.
+    check_does_not_raise(passed, failed,
+                         "plain list is accepted",
+                         lambda: Node().__setitem__("data", [1, 2, 3]))
+    check_does_not_raise(passed, failed,
+                         "plain dict is accepted",
+                         lambda: Node().__setitem__("data", {"x": 1}))
 
     msg = check_catch(passed, failed,
                       "unknown type raises TypeError",
@@ -228,27 +217,44 @@ def run() -> Tuple[int, int]:
           "complex" in msg and "Allowed types" in msg,
           "unknown type message names type and lists allowed")
 
-    # Confirm the complete scalar whitelist is accepted.
+    # Confirm the complete whitelist is accepted, including list and dict.
     n2 = Node()
-    n2["s"] = "str"
-    n2["i"] = 42
-    n2["f"] = 3.14
-    n2["b"] = True
-    n2["n"] = None
-    n2["bytes"] = b"hello"
-    n2["tup"] = (1, "two", Node())
+    n2["s"]    = "str"
+    n2["i"]    = 42
+    n2["f"]    = 3.14
+    n2["b"]    = True
+    n2["n"]    = None
+    n2["by"]   = b"hello"
+    n2["tup"]  = (1, "two", Node())
+    n2["lst"]  = [1, "two", None]
+    n2["dct"]  = {"a": 1, "b": "two"}
     check(passed, failed,
-          n2["s"] == "str" and n2["i"] == 42 and n2["b"] is True,
-          "Node stores all valid scalar types")
+          n2["s"] == "str" and n2["lst"] == [1, "two", None] and n2["dct"] == {"a": 1, "b": "two"},
+          "Node stores all valid types including plain list and dict")
 
-    # Recursive tuple validation: even a list buried inside a tuple
-    # must be caught before the value reaches the dict.
+    # Recursive validation: invalid types inside list, dict, or tuple are caught.
+    msg = check_catch(passed, failed,
+                      "list containing invalid type raises TypeError",
+                      TypeError,
+                      lambda: Node().__setitem__("bad", [1, 3.14j]))
+    check(passed, failed,
+          "complex" in msg,
+          "list-invalid message names the disallowed inner type")
+
+    msg = check_catch(passed, failed,
+                      "dict containing invalid value raises TypeError",
+                      TypeError,
+                      lambda: Node().__setitem__("bad", {"k": 3.14j}))
+    check(passed, failed,
+          "complex" in msg,
+          "dict-invalid message names the disallowed inner value")
+
     msg = check_catch(passed, failed,
                       "tuple containing invalid type raises TypeError",
                       TypeError,
-                      lambda: Node().__setitem__("bad", (1, [2, 3])))
+                      lambda: Node().__setitem__("bad", (1, 3.14j)))
     check(passed, failed,
-          "plain lists" in msg,
+          "complex" in msg,
           "tuple-invalid message names the disallowed inner type")
 
     # ------------------------------------------------------------------
@@ -325,8 +331,8 @@ def run() -> Tuple[int, int]:
     msg = check_catch(passed, failed,
                       "update with invalid value raises TypeError",
                       TypeError,
-                      lambda: Node().update({"bad": [1, 2]}))
-    check(passed, failed, "plain lists" in msg,
+                      lambda: Node().update({"bad": 3.14j}))
+    check(passed, failed, "complex" in msg,
           "update invalid-value message identifies the problem")
 
     # ------------------------------------------------------------------
@@ -514,8 +520,8 @@ def run() -> Tuple[int, int]:
     # Invalid values must be rejected before any state is written.
     msg = check_catch(passed, failed,
                       "merge with invalid value raises TypeError",
-                      TypeError, lambda: Node().merge({"bad": [1, 2]}))
-    check(passed, failed, "plain lists" in msg,
+                      TypeError, lambda: Node().merge({"bad": 3.14j}))
+    check(passed, failed, "complex" in msg,
           "merge invalid-value message identifies the problem")
 
     n.freeze()

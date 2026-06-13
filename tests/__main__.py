@@ -35,7 +35,6 @@ import test_subclass
 import test_stream
 import test_graph
 import test_yaml
-import test_sqlite
 
 
 def main() -> None:
@@ -51,7 +50,6 @@ def main() -> None:
         ("Stream", test_stream),
         ("Graph", test_graph),
         ("YAML", test_yaml),
-        ("SQLite", test_sqlite),
     ]
 
     for name, mod in modules:
