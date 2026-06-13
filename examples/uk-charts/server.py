@@ -67,6 +67,17 @@ _CSS_FILE = _HERE / "ui.css"
 # Concurrent BFS worker threads.
 _N_WORKERS = 6
 
+# Map URL type-slug → node class.  Drives all key-based REST endpoints.
+_TYPE_MAP = {
+    "timeline": Timeline,
+    "decade":   DecadeNode,
+    "year":     YearNode,
+    "month":    MonthNode,
+    "chart":    ChartNode,
+    "artist":   ArtistNode,
+    "release":  ReleaseNode,
+}
+
 # Per-worker generation tag — lets _chain_notify discard stale parent-chain broadcasts.
 _worker_tl = threading.local()
 
@@ -94,13 +105,28 @@ def _lookup(node_id: int):
         return _node_registry.get(node_id)
 
 
+def _resolve_node(type_name: str, key: str):
+    """Get or create a node by REST type name and key.
+
+    Checks the registry first (fast path), then falls back to get_or_create
+    with data derived from the key alone.  Returns (node, error_str) — error
+    is None on success.
+    """
+    cls = _TYPE_MAP.get(type_name)
+    if cls is None:
+        return None, f"Unknown type: {type_name!r}"
+    key  = urllib.parse.unquote(key)   # decode %2F etc. in artist/release paths
+    node = cls.get_or_create(key, cls._data_from_key(key))
+    _register(node)
+    return node, None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Node metadata helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _label(node) -> str:
-    """Human-readable label for a node — delegated to the node's own label property."""
-    return getattr(node, "label", type(node).__name__)
+    return node.get_rendering().label
 
 
 def _node_type(node) -> str:
@@ -118,23 +144,17 @@ def _node_info(node) -> dict:
     Mixin attributes (RenderMixin, PhysicsMixin, GraphBehavior) are read via
     getattr so that nodes which do not inherit a mixin still get safe defaults.
     """
-    g = callable(getattr(node, "get", None))
+    name = _node_type(node)
+    r    = node.get_rendering()
+    p    = node.get_physics()
+    if not r.colour_key:  r.colour_key = name
+    if not r.type_label:  r.type_label = name
+    if not r.label_lines: r.label_lines = [r.label]
     info: dict = {
         "id":        id(node),
-        "label":     _label(node),
-        "node_type": _node_type(node),
-        "status":    (node.get("status", "") if g else ""),
-        # RenderMixin — visual defaults; client reads these directly
-        "node_colour": getattr(node, "node_colour", "#888888"),
-        "node_radius": getattr(node, "node_radius", 6),
-        # PhysicsMixin — D3 placement and force parameters; client applies directly
-        "target_radius": getattr(node, "target_radius", 100),
-        "link_strength": getattr(node, "link_strength", 0.4),
-        "child_spread":  getattr(node, "child_spread",  80),
-        "charge":        getattr(node, "charge",        -30),
-        "collide_pad":   getattr(node, "collide_pad",   3),
-        # GraphBehavior — operational flags
-        "auto_expand": getattr(node, "auto_expand", False),
+        "node_type": name,
+        "rendering": {k: getattr(r, k) for k in vars(type(r)) if not k.startswith("_")},
+        "physics":   {k: getattr(p, k) for k in vars(type(p)) if not k.startswith("_")},
     }
     info.update(node.node_extra())
     return info
@@ -144,29 +164,15 @@ def _node_info(node) -> dict:
 # BFS expansion logic
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _expand_node(node_id: int, gen: int = -1) -> None:
-    """Iterate node_id; each child is added to the canvas via BaseNode.add_to_canvas."""
-    node = _lookup(node_id)
-    if node is None:
-        _bfs._broadcast({"type": "error", "node_id": node_id, "error": "Node not found"})
-        return
-    try:
-        for _ in node:
-            if gen != -1 and gen != _bfs._gen:
-                return          # reset happened mid-iteration; stop
-    except Exception as exc:
-        import traceback; traceback.print_exc()
-        _bfs._broadcast({"type": "error", "node_id": node_id, "error": str(exc)})
-    # Broadcast updated status so the browser can mark the node as visited.
+def _broadcast_expanded(node) -> None:
+    """Broadcast the 'expanded' event so the browser can mark the node as visited."""
     has_get = callable(getattr(node, "get", None))
-    status  = node.get("status", "") if has_get else ""
-    label   = node.get("label",  "") if has_get else str(node_id)
-    if not label and has_get:
-        label = getattr(node, "label", "") or ""
-    ev = {"type": "expanded", "id": node_id, "status": status, "label": label}
-    if status == "error":
-        ev["error"] = node.get("error", "")
-        ev["trace"] = node.get("error_trace", "")
+    error   = node.get("error", "") if has_get else ""
+    label   = node.get_rendering().label
+    ev = {"type": "expanded", "id": id(node), "label": label}
+    if error:
+        ev["error"] = error
+        ev["trace"] = node.get("error_trace", "") if has_get else ""
     _bfs._broadcast(ev)
 
 
@@ -227,8 +233,8 @@ class BFSManager:
                 self._clients.remove(q)
             except ValueError:
                 pass
-            if not self._clients:
-                self.reset()    # last client left — invalidate in-flight work
+            # Don't reset on disconnect — a browser refresh is a brief gap, not
+            # a session end.  /root is the only intended reset point.
 
     def _broadcast(self, event: dict) -> None:
         """Enqueue an event for the broadcaster thread to forward to clients."""
@@ -263,37 +269,39 @@ class BFSManager:
 
     # ── Queue control ─────────────────────────────────────────────────────────
 
-    def push(self, node_id: int, gen: int = -1) -> None:
-        """
-        Enqueue node_id for cascade expansion.
+    def queue_request(self, node, fn: str) -> None:
+        """Enqueue a task for node.handle_task(fn).
 
-        No-op if:  stopped (_stop_flag is True), already seen, or gen is
-        stale (worker started before the last reset).
-        Workers block when paused, so the queue can grow while paused and
-        drain naturally on resume.
+        No-op if stopped or if this (node, fn) pair is already queued/seen.
+        The gen is captured at enqueue time so stale tasks are discarded by
+        the worker without affecting newer ones.
         """
         if self._stop_flag:
             return
-        if gen != -1 and gen != self._gen:
-            return           # stale worker from before last reset
+        node_id = id(node)
+        if fn == "post_init":
+            parent_id = getattr(_worker_tl, "current_node_id", None)
+            object.__setattr__(node, "_parent_id", parent_id)
+            object.__setattr__(node, "_post_init_pending", True)
         with self._seen_lock:
-            if node_id in self._seen:
+            key = (node_id, fn)
+            if key in self._seen:
                 return
-            self._seen.add(node_id)
-        self._queue.put(node_id)
+            self._seen.add(key)
+        self._queue.put((node, fn, self._gen))
 
     def explore(self, node_id: int) -> None:
-        """
-        User-initiated expand (from POST /explore/<id>).
+        """User-initiated click from POST /explore/<id>.
 
-        Clears the stopped flag so cascading can resume.  Removes node_id
-        from _seen to allow re-expansion when the user re-clicks a visited
-        node.
+        Clears the stopped flag and allows re-expansion of an already-seen node.
         """
         self._stop_flag = False
+        node = _lookup(node_id)
+        if node is None:
+            return
         with self._seen_lock:
-            self._seen.discard(node_id)    # allow re-click
-        self.push(node_id, gen=self._gen)
+            self._seen.discard((node_id, "click"))
+        self.queue_request(node, "click")
 
     def pause(self) -> None:
         """Block workers after their current fetch finishes."""
@@ -340,7 +348,7 @@ class BFSManager:
             self._pause_event.wait()       # blocks here when paused
 
             try:
-                node_id = self._queue.get(timeout=1)
+                node, fn, gen = self._queue.get(timeout=1)
             except queue.Empty:
                 continue
 
@@ -348,9 +356,12 @@ class BFSManager:
                 self._in_flight += 1
 
             try:
-                gen = self._gen
-                _worker_tl.gen = gen
-                _expand_node(node_id, gen)
+                if gen == self._gen:
+                    _worker_tl.gen = gen
+                    _worker_tl.current_node_id = id(node)
+                    node.handle_task(fn)
+                    if fn == "click":
+                        _broadcast_expanded(node)
             finally:
                 queued = self._queue.qsize()
                 with self._flight_lock:
@@ -414,7 +425,10 @@ def _init() -> Timeline:
     _bfs.reset()
     model.set_manager(_bfs, _chain_notify, _console_log)
     _root = Timeline.get_or_create("timeline", {})
+    _root._digest()
+    _root._db_save()
     _register(_root)
+    _root.add_to_canvas(None)
     _bfs._root_id = id(_root)
     return _root
 
@@ -471,6 +485,37 @@ class _Handler(BaseHTTPRequestHandler):
                 _bfs.explore(id(root))
             self._json(200, {"node": _node_info(root), "auto_expanding": auto})
 
+        elif path == "/info":
+            # Non-destructive: returns current root id without resetting.
+            root_id = getattr(_bfs, "_root_id", None)
+            self._json(200, {"root_id": root_id})
+
+        elif path.startswith("/node/"):
+            # GET /node/<type>/<key> — inspect one node; creates it if not yet seen.
+            rest  = path[len("/node/"):]
+            slash = rest.find("/")
+            if slash == -1:
+                self._json(400, {"error": "Expected /node/<type>/<key>"}); return
+            type_name, key = rest[:slash], rest[slash + 1:]
+            node, err = _resolve_node(type_name, key)
+            if err:
+                self._json(400, {"error": err}); return
+            self._json(200, {"node": _node_info(node)})
+
+        elif path.startswith("/nodes/"):
+            # GET /nodes/<type>?q=<term> — list registered nodes of a type, optionally filtered.
+            type_name = path[len("/nodes/"):]
+            cls = _TYPE_MAP.get(type_name)
+            if cls is None:
+                self._json(400, {"error": f"Unknown type: {type_name!r}"}); return
+            qs = urllib.parse.parse_qs(parsed.query)
+            q  = qs.get("q", [""])[0].lower()
+            with _registry_lock:
+                nodes = [n for n in _node_registry.values() if isinstance(n, cls)]
+            results = [_node_info(n) for n in nodes
+                       if not q or q in _label(n).lower()]
+            self._json(200, {"type": type_name, "nodes": results})
+
         elif path == "/stream":
             self._stream()
 
@@ -504,14 +549,57 @@ class _Handler(BaseHTTPRequestHandler):
         path   = parsed.path.rstrip("/") or "/"
 
         if path.startswith("/explore/"):
+            rest = path[len("/explore/"):]
             try:
-                node_id = int(path[len("/explore/"):])
+                # Numeric id — browser click path; keep working as before.
+                node_id = int(rest)
+                if _lookup(node_id) is None:
+                    self._json(404, {"error": "Node not found"}); return
+                _bfs.explore(node_id)
+                self._json(200, {"queued": True})
             except ValueError:
-                self._json(400, {"error": "Bad node id"}); return
-            if _lookup(node_id) is None:
-                self._json(404, {"error": "Node not found"}); return
-            _bfs.explore(node_id)
-            self._json(200, {"queued": True})
+                # <type>/<key> — REST path; resolve or create on demand.
+                slash = rest.find("/")
+                if slash == -1:
+                    self._json(400, {"error": "Expected /explore/<type>/<key>"}); return
+                type_name, key = rest[:slash], rest[slash + 1:]
+                node, err = _resolve_node(type_name, key)
+                if err:
+                    self._json(400, {"error": err}); return
+                if _root is not None and getattr(node, "_parent_id", None) is None:
+                    object.__setattr__(node, "_parent_id", id(_root))
+                _bfs.explore(id(node))
+                self._json(200, {"queued": True, "node": _node_info(node)})
+
+        elif path == "/search":
+            # POST /search?q=<term> — fetch top OCC hit and add it to the canvas.
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            q  = qs.get("q", [""])[0].strip()
+            if not q:
+                self._json(400, {"error": "Missing q"}); return
+            try:
+                import json as _json
+                raw     = model.BaseNode._fetch_raw(
+                    model.BaseNode._SUGGEST_BASE + urllib.parse.quote_plus(q))
+                data    = _json.loads(raw)
+                artists = data.get("results", {}).get("artist", [])
+                if not artists:
+                    self._json(200, {"found": False, "q": q}); return
+                top     = artists[0]
+                url     = top.get("url", "")
+                if not url:
+                    self._json(200, {"found": False, "q": q}); return
+                artist_path = url.replace("https://www.officialcharts.com", "").rstrip("/") + "/"
+                name        = top.get("title", "")
+                node        = ArtistNode.get_or_create(
+                    artist_path, {"name": name, "artist_path": artist_path})
+                if _root is not None and getattr(node, "_parent_id", None) is None:
+                    object.__setattr__(node, "_parent_id", id(_root))
+                if not getattr(node, "_post_init_pending", False):
+                    node.add_to_canvas()
+                self._json(200, {"found": True, "node": _node_info(node)})
+            except Exception as exc:
+                self._json(500, {"error": str(exc)})
 
         elif path == "/pause":
             _bfs.pause()
@@ -575,24 +663,20 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _stats(self, node_id: int) -> None:
         """
-        Fetch full chart timeline stats for a single release node.
-
-        Called on hover by the tooltip for releases that haven't been expanded
-        yet (so chart_score is still 0).  fetch_timeline() is idempotent.
+        Fetch chart run data for a release not yet expanded, then return its
+        rendered tooltip so the client can update without a full node refresh.
         """
         node = _lookup(node_id)
         if node is None or not isinstance(node, ReleaseNode):
             self._json(404, {"error": "Not a release node"}); return
         try:
-            node.fetch_timeline()
+            node._digest()
         except Exception as exc:
             self._json(200, {"error": str(exc)}); return
+        r = node.get_rendering()
         self._json(200, {
-            "peak_position": node.get("peak_position", 0),
-            "total_weeks":   node.get("total_weeks",   0),
-            "chart_from":    node.get("chart_from",   ""),
-            "chart_to":      node.get("chart_to",     ""),
-            "chart_score":   node.get("chart_score",  0.0),
+            "tooltip":     r.tooltip,
+            "stats_stale": r.stats_stale,
         })
 
     # ── Search ────────────────────────────────────────────────────────────────

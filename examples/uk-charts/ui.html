@@ -91,21 +91,12 @@
 
 const colour = d => {
   if (typeof d === "string") return Prefs.get("nodeColour", d) || "#555";
-  // Releases split by medium so albums and singles stay visually distinct.
-  if (d.node_type === "release") {
-    const key = d.medium === "single" ? "release_single" : "release_album";
-    return Prefs.get("nodeColour", key) || d.node_colour || "#555";
-  }
-  // Prefs override takes precedence; fall back to node_colour from RenderMixin.
-  return Prefs.get("nodeColour", d.node_type) || d.node_colour || "#555";
+  return Prefs.get("nodeColour", d.rendering.colour_key) || d.rendering.node_colour || "#555";
 };
 
-// Release radius scales with log-weighted chart score so long-running chart-toppers
-// appear larger.  All other types use the node_radius from RenderMixin (sent by
-// the server) so changing the mixin value takes effect on next expansion.
 const radius = d => {
   if (typeof d === "string") return Prefs.get("nodePhysics", d)?.node_radius || 6;
-  return d.node_radius || 6;
+  return d.rendering.node_radius || 6;
 };
 
 // ── D3 setup ───────────────────────────────────────────────────────────────
@@ -137,7 +128,6 @@ svg.on("click", () => { tipEl.style.display = "none"; });
 const SIM = Prefs.get("simulation");
 
 // The set of edge types that belong to the temporal spine (used by angle force).
-const TEMPORAL = new Set(["timeline-decade","decade-year","year-month","month-week"]);
 
 // Link widths by edge type — purely visual, not physics.
 const LINK_WIDTH = {
@@ -211,38 +201,41 @@ function temporalAngleForce(strength, radialStrength) {
 const sim = d3.forceSimulation()
   .force("link", d3.forceLink().id(d => d.id)
     // Distance comes from the target node's target_radius (PhysicsMixin).
-    .distance(d => d.target.target_radius ?? 80)
+    .distance(d => d.target.physics.target_radius ?? 80)
     .strength(d => {
       const k   = `${d.source.node_type}-${d.target.node_type}`;
       const tgt = d.target;
       // Spine links use the target node's link_strength directly.
-      if (TEMPORAL.has(k)) return tgt.link_strength ?? 0.8;
-      // Release–artist strength scales with chart score when available.
+      // Release–artist strength uses the best peak across all runs.
       if (k === "artist-release" || k === "release-artist") {
-        const rel   = d.source.node_type === "release" ? d.source : d.target;
-        const base  = rel.link_strength ?? 0.55;
-        const score = rel.chart_score || 0;
-        return score > 0
-          ? Math.min(base * 1.55, Math.max(0.05, Math.sqrt(score) / 9))
-          : base;
+        const rel  = d.source.node_type === "release" ? d.source : d.target;
+        const base = rel.physics.link_strength ?? 0.55;
+        const runs = rel.runs || [];
+        if (!runs.length) return base;
+        const peak = Math.min(...runs.map(r => r.peak_position));
+        return Math.min(base * 1.55, Math.max(0.05, (101 - peak) / 150));
       }
-      // Week–release strength scales with run length and score.
+      // Week–release strength: find the matching run and use its mean position.
       if (k === "week-release") {
-        const rl    = d.run_length || 1;
-        const score = tgt.chart_score || 0;
-        const cap   = tgt.link_strength ?? 0.45;
-        return Math.min(0.06 + rl * 0.02 + Math.sqrt(score) * 0.025, cap);
+        const chart = d.source.node_type === "chart" ? d.source : d.target;
+        const rel   = d.source.node_type === "release" ? d.source : d.target;
+        const runs  = rel.runs || [];
+        const key   = `${chart.chart_slug}/${chart.date}`;
+        const run   = runs.find(r => `${r.chart_slug}/${r.date}` === key);
+        const mean  = run ? run.mean_position : 50;
+        const cap   = rel.physics.link_strength ?? 0.45;
+        return Math.min((101 - mean) / 150, cap);
       }
       // All other link types use the target node's base link_strength.
-      return tgt.link_strength ?? 0.4;
+      return tgt.physics.link_strength ?? 0.4;
     })
   )
   .force("charge",  d3.forceManyBody()
     // charge comes from the node's PhysicsMixin attribute.
-    .strength(d => d.charge ?? -30)
+    .strength(d => d.physics.charge ?? -30)
     .distanceMax(SIM.chargeDistMax)
   )
-  .force("collide", d3.forceCollide().radius(d => radius(d) + (d.collide_pad ?? SIM.collidePad ?? 3)))
+  .force("collide", d3.forceCollide().radius(d => radius(d) + (d.physics.collide_pad ?? SIM.collidePad ?? 3)))
   .force("center",  d3.forceCenter(0, 0).strength(SIM.centerStrength))
   .force("temporal-angle", temporalAngleForce(SIM.angleStrength, SIM.radialStrength))
   .alphaDecay(SIM.alphaDecay)
@@ -259,21 +252,19 @@ const linkSet  = new Set();   // "srcId~tgtId" keys — prevents duplicate edges
 
 // ── Node rendering ─────────────────────────────────────────────────────────
 
-// Split long labels across two tspan lines for week and month nodes.
+// label_lines comes from RenderMixin — nodes declare their own line splits.
 function applyLabel(sel) {
   sel.each(function(d) {
-    const t = d3.select(this).text(null);
-    if (d.node_type === "week" && d.label.startsWith("New Entries ")) {
+    const t     = d3.select(this).text(null);
+    const lines = d.rendering.label_lines?.length > 1 ? d.rendering.label_lines : null;
+    if (lines) {
       t.attr("dy", radius(d) + 6);
-      t.append("tspan").attr("x", 0).text("New Entries");
-      t.append("tspan").attr("x", 0).attr("dy", "1.1em").text(d.label.slice(12));
-    } else if (d.node_type === "month") {
-      const parts = d.label.split(" ");
-      t.attr("dy", radius(d) + 6);
-      t.append("tspan").attr("x", 0).text(parts[0] || "");
-      if (parts[1]) t.append("tspan").attr("x", 0).attr("dy", "1.1em").text(parts[1]);
+      lines.forEach((ln, i) => {
+        const s = t.append("tspan").attr("x", 0).text(ln);
+        if (i > 0) s.attr("dy", "1.1em");
+      });
     } else {
-      t.attr("dy", radius(d) + 9).text(truncate(d.label, 16));
+      t.attr("dy", radius(d) + 9).text(truncate(d.rendering.label, 16));
     }
   });
 }
@@ -370,12 +361,12 @@ function addChild(child, parentId) {
     let nd;
 
     const angle  = _temporalAngle(child);
-    const spread = child.child_spread ?? SIM.defaultSpread ?? 80;
+    const spread = child.physics.child_spread ?? SIM.defaultSpread ?? 80;
     if (prev) {
       nd = { ...child, x: prev.x, y: prev.y, vx: 0, vy: 0 };
     } else if (parent && angle !== null) {
       // Temporal children: spawn at their home angle at target_radius from parent.
-      const r = child.target_radius ?? 100;
+      const r = child.physics.target_radius ?? 100;
       nd = { ...child,
         x: parent.x + r * Math.cos(angle),
         y: parent.y + r * Math.sin(angle),
@@ -398,7 +389,7 @@ function addChild(child, parentId) {
     if (angle !== null) {
       nd._homeAngle      = angle;
       nd._temporalParentId = parentId;
-      nd._targetRadius   = child.target_radius ?? 100;
+      nd._targetRadius   = child.physics.target_radius ?? 100;
     }
 
     gNodes.push(nd);
@@ -445,13 +436,13 @@ function _setupSSE() {
 
   _sse.addEventListener("expanded", e => {
     const data = JSON.parse(e.data);
-    if (data.label) actLog(data.label, data.status || "done");
-    if (data.status === "error") {
-      conLog(`✗ ${data.label || data.id}: ${data.error || "unknown error"}`, "error");
+    if (data.label) actLog(data.label, data.error ? "error" : "done");
+    if (data.error) {
+      conLog(`✗ ${data.label || data.id}: ${data.error}`, "error");
       if (data.trace) conLog(data.trace, "trace");
     }
     nodeG.selectAll("g.node").filter(d => d.id === data.id)
-      .select("circle").attr("stroke", data.status === "error" ? "#f44" : "#0a0a0a");
+      .select("circle").attr("stroke", data.error ? "#f44" : "#0a0a0a");
   });
 
   _sse.addEventListener("status", e => {
@@ -499,7 +490,7 @@ function _bfsToDepth(rootId, depth) {
 // POST to /explore/<id> — user-initiated node expansion.
 function _postExplore(nodeId) {
   const nd = gNodes.find(n => n.id === nodeId);
-  if (nd) actLog(nd.label, "pending");
+  if (nd) actLog(nd.rendering.label, "pending");
   fetch(`/explore/${nodeId}`, { method: "POST" }).catch(() => {});
 }
 
@@ -552,7 +543,7 @@ function redraw() {
   nSel.merge(nEnter).select("circle")
     .attr("r",      d => radius(d))
     .attr("fill",   d => colour(d))
-    .attr("stroke", d => d.status === "error" ? "#f44" : d.status === "fetching" ? "#fff" : "#0a0a0a");
+    .attr("stroke", d => d.error ? "#f44" : "#0a0a0a");
   applyLabel(nSel.merge(nEnter).select("text"));
   nSel.exit().remove();
 
@@ -629,17 +620,14 @@ let _tipNode = null, _tipEvent = null;
 function showTip(e, d) {
   tipEl.style.display = "block";
 
-  // Lazy-fetch chart stats for unexpanded releases (chart_score still 0)
-  if (d.node_type === "release" && !d.peak_position && !d._statsFetching) {
+  // Lazy-fetch runs for releases not yet expanded — tooltip grows once loaded.
+  if (d.rendering.stats_stale && !d._statsFetching) {
     d._statsFetching = true;
     fetch(`/stats/${d.id}`).then(r => r.json()).then(s => {
-      if (s.peak_position) {
-        d.peak_position = s.peak_position;
-        d.total_weeks   = s.total_weeks;
-        d.chart_from    = s.chart_from;
-        d.chart_to      = s.chart_to;
-        d.chart_score   = s.chart_score;
-        if (_tipNode === d) showTip(_tipEvent, d);   // refresh if still open
+      if (s.tooltip) {
+        d.rendering.tooltip     = s.tooltip;
+        d.rendering.stats_stale = s.stats_stale ?? false;
+        if (_tipNode === d) showTip(_tipEvent, d);
       }
     }).catch(() => {});
   }
@@ -657,31 +645,18 @@ function showTip(e, d) {
   tipEl.style.top  = ty + "px";
 
   let html =
-    `<div class="tip-type">${d.node_type}${d.medium ? " — " + d.medium : ""}</div>` +
-    `<strong>${d.label || d.id}</strong>`;
+    `<div class="tip-type">${d.rendering.type_label}</div>` +
+    `<div class="tip-title">${d.rendering.label || d.id}</div>`;
 
-  if (d.node_type === "release") {
-    if (d.peak_position) {
-      html += `<br><span style="color:#aaa">Peak: #${d.peak_position}</span>`;
-      if (d.total_weeks)
-        html += `<span style="color:#666"> · ${d.total_weeks} week${d.total_weeks > 1 ? "s" : ""}</span>`;
-      if (d.chart_from && d.chart_to && d.chart_from !== d.chart_to)
-        html += `<br><span style="color:#666;font-size:9px">${d.chart_from} → ${d.chart_to}</span>`;
-      else if (d.chart_from)
-        html += `<br><span style="color:#666;font-size:9px">${d.chart_from}</span>`;
-    } else if (d.position) {
-      html += `<br><span style="color:#aaa">Position: #${d.position}</span>`;
-      if (d.chart_date)
-        html += `<span style="color:#666;font-size:9px"> · ${d.chart_date}</span>`;
-    }
-    if (d.artist) html += `<br><span style="color:#888">${d.artist}</span>`;
-  } else {
-    if (d.chart_date) html += `<br><span style="color:#888">charted ${d.chart_date}</span>`;
+  for (const row of (d.rendering.tooltip || [])) {
+    const valClass = "tip-value" + (row.small ? " small" : "");
+    html += `<div class="tip-row">`;
+    if (row.label) html += `<span class="tip-label">${row.label}</span>`;
+    html += `<span class="${valClass}">${row.value}</span></div>`;
   }
 
-  if (d.path) html += `<br><span style="color:#555;font-size:9px">${d.path}</span>`;
-  if (d.status && d.status !== "done")
-    html += `<br><span style="color:#c62828">${d.status}</span>`;
+  if (d.error)
+    html += `<div class="tip-row"><span class="tip-value" style="color:#f44">Error</span></div>`;
 
   tipEl.innerHTML = html;
 }
