@@ -1,27 +1,27 @@
 ## @file test_graph.py
 ##
-## @brief Unit tests for ``GraphMixin``.
+## @brief Unit tests for the ``Graph`` node container.
 ##
 ## Sections:
 ##
-##   - **get_or_create** — identity semantics, ``_key`` injection, defaults
-##     applied only on first call, and behaviour when no defaults are given.
-##   - **clear_registry** — cleared registries produce fresh instances; calling
-##     on a class that has never registered a node is a no-op.
-##   - **registry isolation** — each concrete subclass owns an independent
-##     registry; a parent class registry must never be shared with a subclass.
-##   - **graph_key / is_known / mark_known** — read-only graph state properties
-##     work on nodes created via ``get_or_create()`` and on plain nodes that
-##     were not.
-##   - **to_plain: $ref emission** — a keyed node referenced from two places in
-##     the same tree emits a full dict on first encounter and ``{"$ref": key}``
-##     on every subsequent encounter; unkeyed nodes are never deduplicated.
-##   - **restore: $ref resolution** — a snapshot containing ``$ref`` markers
-##     round-trips correctly, restoring a true graph where both references in
-##     the tree point to the *same* Python object.
-##   - **restore: $ref error** — restoring a snapshot whose ``$ref`` key is
-##     absent from the registry raises a ``KeyError`` with the missing key in
-##     the message.
+##   - **Graph: construction and ensure** — prefix composition, identity
+##     semantics, and ``_key`` stored as the fully-qualified key.
+##   - **Graph: add and type safety** — correct list routing, TypeError on
+##     undeclared types.
+##   - **Graph: two-pass deserialise** — cross-type ``$ref`` links between node
+##     collections resolve correctly because all nodes are pre-registered before
+##     any reference is resolved.
+##   - **Graph: nested Graphs** — child graphs compose prefixes; two-pass
+##     pre-registration recurses into nested graph snapshots.
+##   - **to_plain: $ref emission** — any keyed node (``_key`` set) emits a
+##     full dict on first encounter and ``{"$ref": key}`` on every subsequent
+##     encounter; no ``Graph`` inheritance is required.
+##   - **deserialise: $ref resolution** — cross-references in plain snapshots
+##     round-trip correctly when ``deserialise()`` is called on the root node.
+##   - **deserialise: $ref across SerialisableList** — the ``$ref`` / registry
+##     mechanism works when shared nodes appear as list items.
+##   - **deserialise: error handling** — missing ``$ref`` raises ``KeyError``
+##     with the absent key; non-dict raises ``TypeError``.
 ##
 ## @copyright Copyright (c) 2026 Tim Hosking
 ## @see https://github.com/munger
@@ -40,10 +40,10 @@ for _d in (_PKG_DIR, _ROOT_DIR):
         sys.path.insert(0, _d)
 
 from node_x import (
-    GraphMixin,
+    Graph,
     Node,
     Serialisable,
-    SerialisableNodeList,
+    SerialisableList,
 )
 
 from _helpers import (
@@ -55,12 +55,7 @@ from _helpers import (
 
 
 def run() -> Tuple[int, int]:
-    ## @brief Execute all GraphMixin test sections and return pass/fail counts.
-    ##
-    ## Local class definitions are used inside each section rather than
-    ## module-level fixtures so that each section starts with a clean,
-    ## empty registry.  This prevents registry state from one section
-    ## polluting assertions in another.
+    ## @brief Execute all Graph test sections and return pass/fail counts.
     ##
     ## @return ``(pass_count, fail_count)`` across all sections.
 
@@ -68,157 +63,219 @@ def run() -> Tuple[int, int]:
     failed: List[str] = []
 
     # ------------------------------------------------------------------
-    heading("GraphMixin: get_or_create")
+    heading("Graph: construction and ensure")
     # ------------------------------------------------------------------
-    # get_or_create is the core graph primitive: it guarantees that the
-    # same key always yields the same Python object, regardless of how many
-    # times or from how many call sites it is invoked.
+    # A Graph subclass declares list_fields to type its node collections.
+    # ensure() guarantees identity: the same key always returns the
+    # same Python object.  The node's _key is stored as the fully-qualified
+    # (prefixed) form.
 
-    class GNode(GraphMixin, Node):
-        pass
+    class ArtistNode(Serialisable, Node):
+        restore_via_payload = True
 
-    GNode.clear_registry()
+    class TestGraph(Graph):
+        list_fields = {"artists": (SerialisableList, ArtistNode)}
 
-    a = GNode.get_or_create("k1", {"label": "first"})
-    b = GNode.get_or_create("k1")
+    g = TestGraph({"_key": "uk"})
 
-    check(passed, failed, a is b,
-          "get_or_create returns same instance for same key")
-    check(passed, failed, a["_key"] == "k1",
-          "get_or_create stores _key in node payload")
-    check(passed, failed, a["label"] == "first",
-          "get_or_create applies defaults on first call")
+    beatles = g.ensure(ArtistNode, "beatles", name="The Beatles")
 
-    # Defaults supplied to a cache-hit call must be silently ignored so
-    # that a second discovery of the same entity cannot mutate shared state.
-    b_with_defaults = GNode.get_or_create("k1", {"label": "overwrite-attempt"})
-    check(passed, failed, b_with_defaults["label"] == "first",
-          "get_or_create ignores defaults on cache hit")
+    check(passed, failed, isinstance(beatles, ArtistNode),
+          "ensure returns an ArtistNode")
+    check(passed, failed, beatles["_key"] == "uk/beatles",
+          "ensure stores fully-qualified _key in node")
+    check(passed, failed, beatles["name"] == "The Beatles",
+          "ensure applies kwargs as initial payload")
 
-    # Creating with no defaults produces a node that only has _key set.
-    c = GNode.get_or_create("k2")
-    check(passed, failed, c["_key"] == "k2",
-          "get_or_create with no defaults sets _key only")
-    check(passed, failed, c is not a,
-          "get_or_create returns distinct instance for different key")
+    beatles2 = g.ensure(ArtistNode, "beatles")
+    check(passed, failed, beatles is beatles2,
+          "ensure returns same instance for same key")
 
-    GNode.clear_registry()
+    stones = g.ensure(ArtistNode, "stones")
+    check(passed, failed, stones is not beatles,
+          "ensure returns distinct instance for different key")
+    check(passed, failed, stones["_key"] == "uk/stones",
+          "second node also carries prefixed _key")
 
-    # ------------------------------------------------------------------
-    heading("GraphMixin: clear_registry")
-    # ------------------------------------------------------------------
-    # After clear_registry() a fresh call to get_or_create must produce a
-    # new instance, not the old one.  Calling clear_registry() on a class
-    # that has never called get_or_create must be a safe no-op.
+    # Graph with no _key: local keys used unchanged.
+    class UnprefixedGraph(Graph):
+        list_fields = {"artists": (SerialisableList, ArtistNode)}
 
-    class CNode(GraphMixin, Node):
-        pass
-
-    original = CNode.get_or_create("x", {"v": 1})
-    CNode.clear_registry()
-    reborn   = CNode.get_or_create("x", {"v": 2})
-
-    check(passed, failed, reborn is not original,
-          "clear_registry causes next get_or_create to create a new instance")
-    check(passed, failed, reborn["v"] == 2,
-          "new instance after clear_registry picks up fresh defaults")
-
-    # Clearing a class that has never registered is a harmless no-op.
-    class NeverUsed(GraphMixin, Node):
-        pass
-
-    does_not_raise(passed, failed,
-                   "clear_registry on class with no registry is a no-op",
-                   lambda: NeverUsed.clear_registry())
-
-    CNode.clear_registry()
+    ug = UnprefixedGraph()
+    ua = ug.ensure(ArtistNode, "beatles")
+    check(passed, failed, ua["_key"] == "beatles",
+          "graph with no _key stores local key unchanged")
 
     # ------------------------------------------------------------------
-    heading("GraphMixin: registry isolation between subclasses")
+    heading("Graph: prefix and full_key")
     # ------------------------------------------------------------------
-    # Each concrete subclass owns an independent registry dict.  The
-    # ``"_registry" not in cls.__dict__`` guard in get_or_create is what
-    # prevents a subclass from inadvertently sharing its parent's dict.
 
-    class BaseGraph(GraphMixin, Node):
-        pass
-
-    class SubGraph(BaseGraph):
-        pass
-
-    BaseGraph.clear_registry()
-    SubGraph.clear_registry()
-
-    bg = BaseGraph.get_or_create("shared-key", {"source": "base"})
-    sg = SubGraph.get_or_create("shared-key", {"source": "sub"})
-
-    check(passed, failed, bg is not sg,
-          "subclass registry is independent of parent class registry")
-    check(passed, failed, bg["source"] == "base",
-          "parent class node holds its own defaults")
-    check(passed, failed, sg["source"] == "sub",
-          "subclass node holds its own defaults")
-
-    # A key in BaseGraph must not resolve in SubGraph and vice-versa.
-    BaseGraph.get_or_create("base-only", {"v": 10})
-    check(passed, failed, "base-only" not in SubGraph.__dict__.get("_registry", {}),
-          "key registered on parent is absent from subclass registry")
-
-    BaseGraph.clear_registry()
-    SubGraph.clear_registry()
+    check(passed, failed, g.prefix == "uk",
+          "prefix property returns _key value")
+    check(passed, failed, g.full_key("beatles") == "uk/beatles",
+          "full_key prepends prefix")
+    check(passed, failed, ug.prefix == "",
+          "prefix is empty string when _key absent")
+    check(passed, failed, ug.full_key("beatles") == "beatles",
+          "full_key with no prefix returns key unchanged")
 
     # ------------------------------------------------------------------
-    heading("GraphMixin: graph_key / is_known / mark_known")
+    heading("Graph: add and type safety")
     # ------------------------------------------------------------------
-    # graph_key exposes _key as a property.  is_known/mark_known provide a
-    # lightweight visited-flag for BFS traversal without polluting the
-    # public payload with implementation details.
+    # add() routes a node to its matching list by isinstance; an undeclared
+    # type raises TypeError.
 
-    class FlagNode(GraphMixin, Node):
-        pass
+    class TagNode(Serialisable, Node):
+        restore_via_payload = True
 
-    FlagNode.clear_registry()
+    class TypedGraph(Graph):
+        list_fields = {"artists": (SerialisableList, ArtistNode)}
 
-    keyed = FlagNode.get_or_create("fk1")
-    plain = FlagNode({})  # not registered — no _key
+    tg = TypedGraph({"_key": "tg"})
+    artist = ArtistNode({"_key": "tg/solo", "name": "Solo"})
+    tg.add(artist)
 
-    check(passed, failed, keyed.graph_key == "fk1",
-          "graph_key returns _key for a registered node")
-    check(passed, failed, plain.graph_key is None,
-          "graph_key returns None for a node without _key")
+    check(passed, failed, len(tg["artists"]) == 1,
+          "add() appends node to the matching list")
+    check(passed, failed, tg["artists"][0] is artist,
+          "add() stores the exact same instance")
 
-    check(passed, failed, not keyed.is_known,
-          "is_known is False before mark_known()")
-    keyed.mark_known()
-    check(passed, failed, keyed.is_known,
-          "is_known is True after mark_known()")
-
-    check(passed, failed, not plain.is_known,
-          "is_known is False on a plain (unregistered) node")
-
-    FlagNode.clear_registry()
+    msg = catch_into(passed, failed,
+                     "add() with undeclared type raises TypeError",
+                     TypeError,
+                     lambda: tg.add(TagNode({"_key": "tg/t1"})))
+    check(passed, failed, "list_fields" in msg and "TagNode" in msg,
+          "TypeError names the undeclared type and list_fields")
 
     # ------------------------------------------------------------------
-    heading("GraphMixin + Serialisable: to_plain $ref emission")
+    heading("Graph: two-pass deserialise — cross-type $ref resolution")
     # ------------------------------------------------------------------
-    # When the same keyed (GraphMixin) node is reachable from two places in
-    # the tree, to_plain() must emit the full dict exactly once (on first
-    # encounter in depth-first order) and {"$ref": key} for every subsequent
-    # encounter.  Unkeyed nodes — even if the same Python object appears
-    # twice — must never be turned into $ref entries.
+    # The two-pass approach registers all nodes from all list_fields before
+    # resolving any $ref.  This allows a release to $ref an artist that
+    # appears later in the snapshot, and an artist to $ref releases.
 
-    class SNode(GraphMixin, Serialisable, Node):
-        _restore_via_payload = True
+    class ReleaseNode(Serialisable, Node):
+        restore_via_payload = True
+        node_fields = {"artist": ArtistNode}
 
-    class SRoot(Serialisable, Node):
-        _restore_via_payload = True
+    class ReleaseList(SerialisableList["ReleaseNode"]): pass
 
-    SNode.clear_registry()
+    class MusicGraph(Graph):
+        list_fields = {
+            "artists":  (SerialisableList, ArtistNode),
+            "releases": (ReleaseList,      ReleaseNode),
+        }
 
-    shared = SNode.get_or_create("art1", {"name": "The Beatles"})
-    root   = SRoot({})
-    root["ref_a"] = shared   # first path to shared
-    root["ref_b"] = shared   # second path to same object
+    # Build the graph in-memory.
+    mg = MusicGraph({"_key": "music"})
+    beatles = mg.ensure(ArtistNode, "beatles", name="The Beatles")
+    ppm     = mg.ensure(ReleaseNode, "ppm", title="Please Please Me")
+    ppm["artist"] = beatles   # forward reference that becomes $ref
+
+    # Serialise to a plain snapshot.
+    snap = mg.serialise(deep=True)
+
+    check(passed, failed, snap.get("_key") == "music",
+          "serialised graph carries its _key")
+    check(passed, failed, isinstance(snap.get("artists"), list),
+          "serialised graph has artists list")
+    check(passed, failed, isinstance(snap.get("releases"), list),
+          "serialised graph has releases list")
+
+    # The release's artist field should be a $ref (already emitted in artists).
+    release_snap = snap["releases"][0]
+    check(passed, failed, release_snap.get("artist") == {"$ref": "music/beatles"},
+          "release artist is serialised as $ref to beatles")
+
+    # Restore and verify cross-type $ref resolution.
+    restored = MusicGraph.deserialise(snap)
+
+    check(passed, failed, isinstance(restored, MusicGraph),
+          "deserialised result is a MusicGraph")
+    check(passed, failed, len(restored["artists"]) == 1,
+          "restored graph has one artist")
+    check(passed, failed, len(restored["releases"]) == 1,
+          "restored graph has one release")
+
+    r_artist  = restored["artists"][0]
+    r_release = restored["releases"][0]
+
+    check(passed, failed, r_artist["name"] == "The Beatles",
+          "restored artist carries original payload")
+    check(passed, failed, r_release["title"] == "Please Please Me",
+          "restored release carries original payload")
+    check(passed, failed, r_release["artist"] is r_artist,
+          "restored release.artist is the same object as the restored artist")
+
+    # Mutation through one reference must be visible through the other.
+    r_artist["name"] = "Beatles"
+    check(passed, failed, r_release["artist"]["name"] == "Beatles",
+          "mutation through artist reference visible via release.artist")
+
+    # ------------------------------------------------------------------
+    heading("Graph: two-pass — forward $ref (release listed before artist)")
+    # ------------------------------------------------------------------
+    # The pre-pass must handle the case where the $ref appears before the
+    # full node definition in the serialised order.
+
+    forward_snap = {
+        "_key": "music",
+        # release appears FIRST in the snapshot
+        "releases": [
+            {"_key": "music/ppm", "title": "PPM",
+             "artist": {"$ref": "music/beatles"}},  # forward ref
+        ],
+        # artist appears SECOND
+        "artists": [
+            {"_key": "music/beatles", "name": "The Beatles"},
+        ],
+    }
+
+    restored2 = MusicGraph.deserialise(forward_snap)
+    check(passed, failed,
+          restored2["releases"][0]["artist"] is restored2["artists"][0],
+          "forward $ref resolves: release listed before artist in snapshot")
+
+    # ------------------------------------------------------------------
+    heading("Graph: nested Graphs compose prefixes")
+    # ------------------------------------------------------------------
+
+    class SubGraph(Graph):
+        list_fields = {"artists": (SerialisableList, ArtistNode)}
+
+    class SubGraphList(SerialisableList["SubGraph"]): pass
+
+    class RootGraph(Graph):
+        list_fields = {"regions": (SubGraphList, SubGraph)}
+
+    rg = RootGraph({"_key": "root"})
+    uk = rg.ensure(SubGraph, "uk")
+    check(passed, failed, uk["_key"] == "root/uk",
+          "nested graph _key is prefixed by parent")
+    check(passed, failed, uk.prefix == "root/uk",
+          "nested graph prefix reflects full composite key")
+
+    uk_beatles = uk.ensure(ArtistNode, "beatles")
+    check(passed, failed, uk_beatles["_key"] == "root/uk/beatles",
+          "node in nested graph carries doubly-prefixed _key")
+
+    # ------------------------------------------------------------------
+    heading("Graph + Serialisable: to_plain $ref emission")
+    # ------------------------------------------------------------------
+    # Any node carrying _key gets $ref deduplication in to_plain() — no
+    # Graph inheritance required.  The first encounter is serialised in
+    # full; every subsequent encounter emits {"$ref": key}.
+
+    class KNode(Serialisable, Node):
+        restore_via_payload = True
+
+    class KRoot(Serialisable, Node):
+        restore_via_payload = True
+
+    shared = KNode({"_key": "art1", "name": "The Beatles"})
+    root   = KRoot({})
+    root["ref_a"] = shared
+    root["ref_b"] = shared
 
     plain = root.to_plain()
 
@@ -229,55 +286,44 @@ def run() -> Tuple[int, int]:
           plain["ref_b"] == {"$ref": "art1"},
           "to_plain emits $ref on second encounter of same keyed node")
 
-    # An unkeyed node that appears twice must be serialised in full both
-    # times — without _key there is no handle for a $ref to name.
-    unkeyed = SRoot({})
-    unkeyed["x"] = 99
-    root2 = SRoot({})
+    # Unkeyed nodes are never deduplicated.
+    unkeyed = KRoot({"x": 99})
+    root2   = KRoot({})
     root2["u1"] = unkeyed
-    root2["u2"] = unkeyed  # same Python object, no _key
+    root2["u2"] = unkeyed
     plain2 = root2.to_plain()
     check(passed, failed,
           plain2["u1"] == {"x": 99} and plain2["u2"] == {"x": 99},
           "unkeyed node appearing twice is serialised in full both times")
 
-    SNode.clear_registry()
-
     # ------------------------------------------------------------------
-    heading("GraphMixin + Serialisable: restore $ref resolution (graph identity)")
+    heading("Serialisable: deserialise $ref resolution (graph identity)")
     # ------------------------------------------------------------------
-    # A snapshot produced by to_plain() contains $ref markers for shared
-    # keyed nodes.  restore() must resolve those markers back to the *same*
-    # Python object so that the in-memory graph preserves true identity:
-    # mutating the node through one reference is immediately visible through
-    # the other.
+    # $ref markers produced by to_plain() must round-trip back to the
+    # *same* Python object.
 
-    class ArtNode(GraphMixin, Serialisable, Node):
-        _restore_via_payload = True
+    class ArtNode(Serialisable, Node):
+        restore_via_payload = True
 
     class WeekNode(Serialisable, Node):
-        # _node_fields tells _restore_children how to rebuild the child.
-        _restore_via_payload = True
-        _node_fields = {"artist": ArtNode}
+        restore_via_payload = True
+        node_fields = {"artist": ArtNode}
 
     class RootNode(Serialisable, Node):
-        _restore_via_payload = True
-        _node_fields = {"w1": WeekNode, "w2": WeekNode}
+        restore_via_payload = True
+        node_fields = {"w1": WeekNode, "w2": WeekNode}
 
-    ArtNode.clear_registry()
-
-    artist = ArtNode.get_or_create("a1", {"name": "Beatles"})
-    w1     = WeekNode({"date": "1963-01-05"})
-    w2     = WeekNode({"date": "1963-01-12"})
+    artist = ArtNode({"_key": "a1", "name": "Beatles"})
+    w1 = WeekNode({"date": "1963-01-05"})
+    w2 = WeekNode({"date": "1963-01-12"})
     w1["artist"] = artist
-    w2["artist"] = artist   # shared — same Python object
+    w2["artist"] = artist
 
-    root = RootNode({})
-    root["w1"] = w1
-    root["w2"] = w2
+    rn = RootNode({})
+    rn["w1"] = w1
+    rn["w2"] = w2
 
-    # Serialise to plain dict — w2's artist should be a $ref.
-    plain = root.to_plain()
+    plain = rn.to_plain()
     check(passed, failed,
           plain["w1"]["artist"].get("_key") == "a1",
           "to_plain: first artist reference is a full dict")
@@ -285,56 +331,38 @@ def run() -> Tuple[int, int]:
           plain["w2"]["artist"] == {"$ref": "a1"},
           "to_plain: second artist reference is a $ref")
 
-    # Restore and verify that both paths resolve to the same instance.
-    restored = RootNode.restore(plain)
+    res = RootNode.deserialise(plain)
     check(passed, failed,
-          isinstance(restored["w1"]["artist"], ArtNode),
+          isinstance(res["w1"]["artist"], ArtNode),
           "restored first reference is an ArtNode instance")
     check(passed, failed,
-          restored["w1"]["artist"] is restored["w2"]["artist"],
+          res["w1"]["artist"] is res["w2"]["artist"],
           "restored graph: both references are the same Python object")
     check(passed, failed,
-          restored["w1"]["artist"]["name"] == "Beatles",
+          res["w1"]["artist"]["name"] == "Beatles",
           "restored shared node carries its original payload")
-    check(passed, failed,
-          restored["w1"]["date"] == "1963-01-05",
-          "restored w1 carries its own scalar payload")
-    check(passed, failed,
-          restored["w2"]["date"] == "1963-01-12",
-          "restored w2 carries its own scalar payload")
 
-    # Mutating through one reference must be visible through the other,
-    # which is the whole point of graph identity.
-    restored["w1"]["artist"]["name"] = "The Beatles"
+    res["w1"]["artist"]["name"] = "The Beatles"
     check(passed, failed,
-          restored["w2"]["artist"]["name"] == "The Beatles",
+          res["w2"]["artist"]["name"] == "The Beatles",
           "mutation through one reference is visible through the other")
 
-    ArtNode.clear_registry()
-
     # ------------------------------------------------------------------
-    heading("GraphMixin + Serialisable: restore $ref across SerialisableNodeList")
+    heading("Serialisable: deserialise $ref across SerialisableList")
     # ------------------------------------------------------------------
-    # The $ref / _registry mechanism must also work when shared nodes appear
-    # as items in a SerialisableNodeList, since list items are restored via
-    # SerialisableNodeList.restore() which now threads _registry through.
 
-    class ItemNode(GraphMixin, Serialisable, Node):
-        _restore_via_payload = True
+    class ItemNode(Serialisable, Node):
+        restore_via_payload = True
 
     class ListRoot(Serialisable, Node):
-        _restore_via_payload = True
-        _list_fields = {"entries": (SerialisableNodeList, ItemNode)}
+        restore_via_payload = True
+        list_fields = {"entries": (SerialisableList, ItemNode)}
 
-    ItemNode.clear_registry()
+    shared_item = ItemNode({"_key": "i1", "tag": "shared"})
+    lr = ListRoot({})
+    lr["entries"] = SerialisableList([shared_item, shared_item])
 
-    shared_item = ItemNode.get_or_create("i1", {"tag": "shared"})
-    list_root   = ListRoot({})
-    # The same node appears at two positions in the list.
-    lst = SerialisableNodeList([shared_item, shared_item])
-    list_root["entries"] = lst
-
-    plain3 = list_root.to_plain()
+    plain3 = lr.to_plain()
     check(passed, failed,
           isinstance(plain3["entries"], list) and len(plain3["entries"]) == 2,
           "to_plain produces two-element list")
@@ -345,93 +373,143 @@ def run() -> Tuple[int, int]:
           plain3["entries"][1] == {"$ref": "i1"},
           "to_plain: second list item is $ref")
 
-    restored3 = ListRoot.restore(plain3)
-    check(passed, failed,
-          len(restored3["entries"]) == 2,
+    res3 = ListRoot.deserialise(plain3)
+    check(passed, failed, len(res3["entries"]) == 2,
           "restored list has correct length")
     check(passed, failed,
-          restored3["entries"][0] is restored3["entries"][1],
+          res3["entries"][0] is res3["entries"][1],
           "restored list: both entries are the same Python object")
 
-    ItemNode.clear_registry()
-
     # ------------------------------------------------------------------
-    heading("GraphMixin: programmer error — non-string key to get_or_create")
+    heading("Serialisable: deserialise $ref error handling")
     # ------------------------------------------------------------------
-    # Keys are stored as _key in the node payload and used as $ref targets
-    # during serialisation.  Non-string keys corrupt JSON round-trips
-    # (tuples become lists, integers are valid JSON scalars but ambiguous
-    # as $ref values) so get_or_create must reject them immediately with a
-    # message explaining why strings are required.
 
-    class ErrGN(GraphMixin, Node):
-        pass
-
-    ErrGN.clear_registry()
-
-    msg = catch_into(passed, failed,
-                     "get_or_create with int key raises TypeError",
-                     TypeError,
-                     lambda: ErrGN.get_or_create(42))
-    check(passed, failed, "int" in msg and "str" in msg,
-          "TypeError names the bad type and required type")
-    check(passed, failed, "$ref" in msg or "serialis" in msg,
-          "TypeError explains the serialisation reason")
-
-    msg2 = catch_into(passed, failed,
-                      "get_or_create with tuple key raises TypeError",
-                      TypeError,
-                      lambda: ErrGN.get_or_create(("a", "b")))
-    check(passed, failed, "tuple" in msg2,
-          "TypeError for tuple key names the offending type")
-
-    ErrGN.clear_registry()
-
-    # ------------------------------------------------------------------
-    heading("GraphMixin + Serialisable: restore $ref error handling")
-    # ------------------------------------------------------------------
-    # If a snapshot contains a $ref that was not preceded by a full node
-    # definition in the same restore pass, restore() must raise a KeyError
-    # that names the missing key so the caller can diagnose the problem.
-    # restore() with a non-dict argument must also fail early with a clear
-    # message rather than an opaque AttributeError deep in the call stack.
-
-    class ErrNode(GraphMixin, Serialisable, Node):
-        _restore_via_payload = True
+    class ErrNode(Serialisable, Node):
+        restore_via_payload = True
 
     class ErrRoot(Serialisable, Node):
-        _restore_via_payload = True
-        _node_fields = {"child": ErrNode}
+        restore_via_payload = True
+        node_fields = {"child": ErrNode}
 
-    ErrNode.clear_registry()
-
-    # Craft a snapshot where the $ref has no matching full definition.
-    bad_plain = {"child": {"$ref": "nonexistent-key"}}
-
+    bad = {"child": {"$ref": "nonexistent-key"}}
     msg = catch_into(passed, failed,
-                     "restore with unresolvable $ref raises KeyError",
+                     "deserialise with unresolvable $ref raises KeyError",
                      KeyError,
-                     lambda: ErrRoot.restore(bad_plain))
-    check(passed, failed,
-          "nonexistent-key" in msg,
+                     lambda: ErrRoot.deserialise(bad))
+    check(passed, failed, "nonexistent-key" in msg,
           "KeyError message contains the missing key")
     check(passed, failed,
-          "restore()" in msg or "root node" in msg,
-          "KeyError message suggests calling restore() from the root")
+          "deserialise()" in msg or "root node" in msg,
+          "KeyError message suggests calling deserialise() from the root")
 
-    # Non-dict passed to restore() must give a clear TypeError rather than
-    # crashing somewhere inside to_plain() or _from_payload().
     msg3 = catch_into(passed, failed,
-                      "restore(42) raises TypeError",
+                      "deserialise(42) raises TypeError",
                       TypeError,
-                      lambda: ErrNode.restore(42))
+                      lambda: ErrNode.deserialise(42))
     check(passed, failed,
           "mapping" in msg3 and "int" in msg3,
-          "restore non-dict TypeError says 'mapping' and names the type")
+          "non-dict TypeError says 'mapping' and names the type")
     check(passed, failed,
-          "snapshot()" in msg3,
-          "restore non-dict TypeError mentions snapshot() as the correct source")
+          "serialise(deep=True)" in msg3,
+          "non-dict TypeError mentions serialise(deep=True) as the correct source")
 
-    ErrNode.clear_registry()
+    # ------------------------------------------------------------------
+    heading("Graph: programmer errors — ensure and add")
+    # ------------------------------------------------------------------
+    # ensure() must reject non-string keys immediately with a message
+    # that explains the serialisation reason.  Passing a class that is not
+    # declared in list_fields must raise TypeError that names both the class
+    # and list_fields so the fix is obvious.
+
+    class ErrArtist(Serialisable, Node):
+        restore_via_payload = True
+
+    class ErrTag(Serialisable, Node):
+        restore_via_payload = True
+
+    class ErrGraph(Graph):
+        list_fields = {"artists": (SerialisableList, ErrArtist)}
+
+    eg = ErrGraph({"_key": "err"})
+
+    msg_int = catch_into(passed, failed,
+                         "ensure with int key raises TypeError",
+                         TypeError,
+                         lambda: eg.ensure(ErrArtist, 42))
+    check(passed, failed, "int" in msg_int and "str" in msg_int,
+          "TypeError names the bad type and required type")
+    check(passed, failed, "$ref" in msg_int or "serialis" in msg_int,
+          "TypeError explains the serialisation reason")
+
+    msg_tuple = catch_into(passed, failed,
+                           "ensure with tuple key raises TypeError",
+                           TypeError,
+                           lambda: eg.ensure(ErrArtist, ("a", "b")))
+    check(passed, failed, "tuple" in msg_tuple,
+          "TypeError for tuple key names the offending type")
+
+    # Class not in list_fields: TypeError should name the class and list_fields.
+    msg_cls = catch_into(passed, failed,
+                         "ensure with undeclared class raises TypeError",
+                         TypeError,
+                         lambda: eg.ensure(ErrTag, "t1"))
+    check(passed, failed, "ErrTag" in msg_cls and "list_fields" in msg_cls,
+          "TypeError names the undeclared class and list_fields")
+    check(passed, failed, type(eg).__name__ in msg_cls,
+          "TypeError names the graph class so the caller knows which list_fields to update")
+
+    # ------------------------------------------------------------------
+    heading("Graph: from_nodes()")
+    # ------------------------------------------------------------------
+    # from_nodes() constructs a new Graph subclass instance from any
+    # iterable of nodes, routing each via add().  It is inherited by every
+    # Graph subclass automatically.
+
+    class FNArtist(Serialisable, Node):
+        restore_via_payload = True
+
+    class FNRelease(Serialisable, Node):
+        restore_via_payload = True
+
+    class FNGraph(Graph):
+        list_fields = {
+            "artists":  (SerialisableList, FNArtist),
+            "releases": (SerialisableList, FNRelease),
+        }
+
+    a1 = FNArtist({"_key": "fn/a1", "name": "Artist One"})
+    a2 = FNArtist({"_key": "fn/a2", "name": "Artist Two"})
+    r1 = FNRelease({"_key": "fn/r1", "title": "Release One"})
+    r2 = FNRelease({"_key": "fn/r2", "title": "Release Two"})
+
+    result = FNGraph.from_nodes([a1, a2, r1, r2])
+
+    check(passed, failed, isinstance(result, FNGraph),
+          "from_nodes() returns an instance of the subclass")
+    check(passed, failed, len(result["artists"]) == 2,
+          "from_nodes() routes artists to correct list")
+    check(passed, failed, len(result["releases"]) == 2,
+          "from_nodes() routes releases to correct list")
+    check(passed, failed, result["artists"][0] is a1,
+          "from_nodes() preserves node identity — not copies")
+    check(passed, failed, result["releases"][1] is r2,
+          "from_nodes() preserves order")
+
+    # from_nodes() with a generator — consumed lazily
+    gen_result = FNGraph.from_nodes(n for n in [a1, r1])
+    check(passed, failed, len(gen_result["artists"]) == 1,
+          "from_nodes() accepts a generator")
+
+    # Node type not in list_fields raises TypeError
+    class FNOther(Node): pass
+    catch_into(passed, failed,
+               "from_nodes() with undeclared type raises TypeError",
+               TypeError,
+               lambda: FNGraph.from_nodes([FNOther({})]))
+
+    # from_nodes() on empty iterable returns empty graph
+    empty = FNGraph.from_nodes([])
+    check(passed, failed, empty.get("artists") is None and empty.get("releases") is None,
+          "from_nodes() on empty iterable returns empty graph")
 
     return len(passed), len(failed)

@@ -1,18 +1,18 @@
 ## @file test_concurrency.py
 ##
-## @brief Unit tests for ``NodeTransaction``, ``ReadWriteMixin``,
+## @brief Unit tests for ``Transaction``, ``WriteMutex``,
 ##        and the internal ``_RWLock``.
 ##
 ## Sections:
 ##
-##   - **NodeTransaction** — basic cross-node atomic read/write; single
+##   - **Transaction** — basic cross-node atomic read/write; single
 ##     node; 50-node stress test (no deadlock); interaction with
 ##     NodeList; zero-node no-op; duplicate-node de-duplication
 ##     (the constructor deduplicates by id() so no double-lock
 ##     occurs); exception-in-body (locks must be released even when
 ##     the body raises); ``Node.lock`` and ``NodeList.lock`` property
 ##     types.
-##   - **ReadWriteMixin** — basic reading() / write round-trip;
+##   - **WriteMutex** — basic reading() / write round-trip;
 ##     writer blocked while reading() is held; multiple concurrent
 ##     readers allowed simultaneously; re-entrant write from the same
 ##     thread; NodeList integration.
@@ -41,7 +41,7 @@ for _d in (_PKG_DIR, _ROOT_DIR):
     if _d not in sys.path:
         sys.path.insert(0, _d)
 
-from node_x import Node, NodeList, NodeTransaction, ReadWriteMixin
+from node_x import Node, NodeList, Transaction, WriteMutex
 from node_x import _RWLock
 
 from _helpers import check, check_catch, check_does_not_raise, heading
@@ -60,77 +60,77 @@ def run() -> Tuple[int, int]:
     failed: List[str] = []
 
     # ------------------------------------------------------------------
-    heading("NodeTransaction: basic cross-node read/write")
+    heading("Transaction: basic cross-node read/write")
     # ------------------------------------------------------------------
-    # NodeTransaction acquires locks in id()-sorted order so that
+    # Transaction acquires locks in id()-sorted order so that
     # concurrent transactions on the same pair of nodes always agree on
     # acquisition order, preventing ABBA deadlock.
 
     a = Node({"x": 1})
     b = Node({"y": 2})
 
-    with NodeTransaction(a, b):
+    with Transaction(a, b):
         a["x"] = a["x"] + 1
         b["y"] = b["y"] + 1
 
     check(passed, failed, a["x"] == 2 and b["y"] == 3,
-          "NodeTransaction allows cross-node read/write")
+          "Transaction allows cross-node read/write")
 
     # ------------------------------------------------------------------
-    heading("NodeTransaction: single node")
+    heading("Transaction: single node")
     # ------------------------------------------------------------------
 
     n = Node({"a": 1})
-    with NodeTransaction(n):
+    with Transaction(n):
         n["a"] = n["a"] + 10
 
     check(passed, failed, n["a"] == 11,
-          "NodeTransaction with single node works")
+          "Transaction with single node works")
 
     # ------------------------------------------------------------------
-    heading("NodeTransaction: many nodes (no deadlock)")
+    heading("Transaction: many nodes (no deadlock)")
     # ------------------------------------------------------------------
     # 50 nodes acquired in a single transaction: verifies that the
     # id()-sorted acquisition scales without issue.
 
     nodes = [Node({"i": i}) for i in range(50)]
-    with NodeTransaction(*nodes):
+    with Transaction(*nodes):
         total = sum(n["i"] for n in nodes)
     check(passed, failed, total == sum(range(50)),
-          "NodeTransaction acquires 50 locks without deadlock")
+          "Transaction acquires 50 locks without deadlock")
 
     # ------------------------------------------------------------------
-    heading("NodeTransaction: with NodeList")
+    heading("Transaction: with NodeList")
     # ------------------------------------------------------------------
-    # NodeTransaction accepts any object with a .lock property, including
+    # Transaction accepts any object with a .lock property, including
     # NodeList instances.
 
     items = [Node({"x": i}) for i in range(5)]
     nl = NodeList(items)
-    with NodeTransaction(nl, items[0]):
+    with Transaction(nl, items[0]):
         total = sum(n["x"] for n in nl)
     check(passed, failed, total == 10,
-          "NodeTransaction works with NodeList")
+          "Transaction works with NodeList")
 
     # ------------------------------------------------------------------
-    heading("NodeTransaction: zero nodes and duplicate nodes")
+    heading("Transaction: zero nodes and duplicate nodes")
     # ------------------------------------------------------------------
-    # An empty NodeTransaction must be a harmless no-op.  Passing the
+    # An empty Transaction must be a harmless no-op.  Passing the
     # same node twice must not cause a double-lock (the constructor
     # deduplicates by object identity via id()).
 
     check_does_not_raise(passed, failed,
-                         "NodeTransaction() with zero nodes is a no-op",
-                         lambda: NodeTransaction().__enter__().__exit__(None, None, None))
+                         "Transaction() with zero nodes is a no-op",
+                         lambda: Transaction().__enter__().__exit__(None, None, None))
 
     shared_node = Node({"v": 1})
-    with NodeTransaction(shared_node, shared_node):
+    with Transaction(shared_node, shared_node):
         shared_node["v"] = 2
     check(passed, failed, shared_node["v"] == 2,
-          "NodeTransaction deduplicates repeated node (no double-lock)")
+          "Transaction deduplicates repeated node (no double-lock)")
 
     # ------------------------------------------------------------------
-    heading("NodeTransaction: exception in body releases locks")
+    heading("Transaction: exception in body releases locks")
     # ------------------------------------------------------------------
     # __exit__ must release all acquired locks even when the body raises
     # an exception.  After the exception is caught the nodes must be
@@ -139,22 +139,22 @@ def run() -> Tuple[int, int]:
     exc_a = Node({"x": 0})
     exc_b = Node({"y": 0})
     try:
-        with NodeTransaction(exc_a, exc_b):
+        with Transaction(exc_a, exc_b):
             exc_a["x"] = 1
             raise RuntimeError("deliberate")
     except RuntimeError:
         pass
     check_does_not_raise(passed, failed,
-                         "locks released after exception in NodeTransaction body",
+                         "locks released after exception in Transaction body",
                          lambda: exc_a.__setitem__("x", 2))
     check(passed, failed, exc_a["x"] == 2,
-          "node remains usable after exception in NodeTransaction")
+          "node remains usable after exception in Transaction")
 
     # ------------------------------------------------------------------
     heading("Node.lock and NodeList.lock properties")
     # ------------------------------------------------------------------
     # Both Node and NodeList expose a .lock property so that external
-    # callers (including NodeTransaction) can hold the lock across
+    # callers (including Transaction) can hold the lock across
     # operations without knowledge of the internal attribute name.
 
     import threading as _threading
@@ -167,15 +167,15 @@ def run() -> Tuple[int, int]:
           "NodeList.lock returns an RLock instance")
 
     # ------------------------------------------------------------------
-    heading("NodeTransaction: blocks concurrent readers on ReadWriteMixin nodes")
+    heading("Transaction: blocks concurrent readers on WriteMutex nodes")
     # ------------------------------------------------------------------
-    # NodeTransaction must enter _write_guard for each node before
-    # acquiring _lock.  For ReadWriteMixin nodes this acquires the write
+    # Transaction must enter _write_guard for each node before
+    # acquiring _lock.  For WriteMutex nodes this acquires the write
     # side of the RW lock, so concurrent reading() contexts block for
     # the duration of the transaction — matching the behaviour of a
     # plain mutation on such a node.
 
-    class RWNode(ReadWriteMixin, Node):
+    class RWNode(WriteMutex, Node):
         pass
 
     rw_tx = RWNode({"val": 0})
@@ -188,7 +188,7 @@ def run() -> Tuple[int, int]:
     tx_done: List[bool] = []
     reader_thread_obj = threading.Thread(target=tx_reader)
 
-    with NodeTransaction(rw_tx):
+    with Transaction(rw_tx):
         reader_thread_obj.start()
         time.sleep(0.05)
         # Reader should be blocked; record whether it has already run.
@@ -198,34 +198,34 @@ def run() -> Tuple[int, int]:
 
     reader_thread_obj.join()
     check(passed, failed, not ran_inside,
-          "NodeTransaction blocks concurrent reading() on ReadWriteMixin node")
+          "Transaction blocks concurrent reading() on WriteMutex node")
     check(passed, failed, len(reader_ran_during_tx) == 1,
-          "reader proceeds after NodeTransaction exits")
+          "reader proceeds after Transaction exits")
     check(passed, failed, rw_tx["val"] == 99,
           "transaction write committed correctly")
 
     # ------------------------------------------------------------------
-    heading("ReadWriteMixin: basic read/write")
+    heading("WriteMutex: basic read/write")
     # ------------------------------------------------------------------
     # reading() is a context manager that marks the object as being read.
     # Writers block until all active reading() contexts have exited.
     # Normal writes outside reading() contexts proceed immediately.
 
-    class RWNode(ReadWriteMixin, Node):
+    class RWNode(WriteMutex, Node):
         pass
 
     n = RWNode({"counter": 0})
     with n.reading():
         val = n["counter"]
     check(passed, failed, val == 0,
-          "ReadWriteMixin reading() works")
+          "WriteMutex reading() works")
 
     n["counter"] = 42
     check(passed, failed, n["counter"] == 42,
-          "ReadWriteMixin write after reading() works")
+          "WriteMutex write after reading() works")
 
     # ------------------------------------------------------------------
-    heading("ReadWriteMixin: writer blocks during reading()")
+    heading("WriteMutex: writer blocks during reading()")
     # ------------------------------------------------------------------
     # Starts a reader that holds reading() for 0.2 s, then starts a
     # writer 0.05 s later.  Samples the writer's completion flag at
@@ -262,7 +262,7 @@ def run() -> Tuple[int, int]:
           "writer completes after reader exits")
 
     # ------------------------------------------------------------------
-    heading("ReadWriteMixin: multiple concurrent readers")
+    heading("WriteMutex: multiple concurrent readers")
     # ------------------------------------------------------------------
     # Launches 5 threads each holding reading() for 0.1 s.  Tracks the
     # peak concurrent reader count.  Expects at least 3 to overlap,
@@ -292,7 +292,7 @@ def run() -> Tuple[int, int]:
           "multiple concurrent readers allowed (saw at least 3 of 5)")
 
     # ------------------------------------------------------------------
-    heading("ReadWriteMixin: re-entrant write")
+    heading("WriteMutex: re-entrant write")
     # ------------------------------------------------------------------
     # A thread that already holds the write lock must be able to
     # re-enter _write_guard() without deadlocking.  This mirrors what
@@ -314,20 +314,20 @@ def run() -> Tuple[int, int]:
           "re-entrant write produces correct values")
 
     # ------------------------------------------------------------------
-    heading("ReadWriteMixin: with NodeList")
+    heading("WriteMutex: with NodeList")
     # ------------------------------------------------------------------
 
-    class RWNodeList(ReadWriteMixin, NodeList):
+    class RWNodeList(WriteMutex, NodeList):
         pass
 
     rwl = RWNodeList()
     with rwl.reading():
         check(passed, failed, len(rwl) == 0,
-              "ReadWriteMixin NodeList reading() works")
+              "WriteMutex NodeList reading() works")
 
     rwl.append(Node({"x": 1}))
     check(passed, failed, len(rwl) == 1,
-          "ReadWriteMixin NodeList write after reading() works")
+          "WriteMutex NodeList write after reading() works")
 
     # ------------------------------------------------------------------
     heading("_RWLock: same-thread reader does not block writer on same thread")

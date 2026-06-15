@@ -1,8 +1,8 @@
 ## @file test_stream.py
 ##
-## @brief Unit tests for the ``StreamMixin`` lazy-loading contract.
+## @brief Unit tests for the ``Stream`` lazy-loading contract.
 ##
-## ``StreamMixin`` is the engine for lazy tree construction: a caller
+## ``Stream`` is the engine for lazy tree construction: a caller
 ## obtains a root node, begins iterating it via ``stream()``, and
 ## children materialise on demand.  Each child may itself be streamed,
 ## giving a recursive, depth-first lazy population model.
@@ -48,13 +48,13 @@ for _d in (_PKG_DIR, _ROOT_DIR):
     if _d not in sys.path:
         sys.path.insert(0, _d)
 
-from node_x import Node, NodeList, StreamMixin
+from node_x import Node, NodeList, Stream
 
 from _helpers import check, check_does_not_raise, heading
 
 
 def run() -> Tuple[int, int]:
-    ## @brief Execute all StreamMixin test sections and return pass/fail counts.
+    ## @brief Execute all Stream test sections and return pass/fail counts.
     ##
     ## @return ``(pass_count, fail_count)`` across all sections.
 
@@ -62,27 +62,27 @@ def run() -> Tuple[int, int]:
     failed: List[str] = []
 
     # ------------------------------------------------------------------
-    heading("StreamMixin: base class yields nothing in both calling forms")
+    heading("Stream: base class yields nothing in both calling forms")
     # ------------------------------------------------------------------
     # The unoverridden stream() is a no-op whether or not bytes are
     # passed.  Nodes that have nothing to discover simply do not
     # override the method.
 
-    base = StreamMixin()
+    base = Stream()
     check(passed, failed, list(base.stream()) == [],
           "base stream(data=None) yields nothing")
     check(passed, failed, list(base.stream(data=b"payload")) == [],
           "base stream(data=bytes) yields nothing regardless of content")
 
     # ------------------------------------------------------------------
-    heading("StreamMixin: without data (data=None)")
+    heading("Stream: without data (data=None)")
     # ------------------------------------------------------------------
     # When no bytes are provided, the implementation derives children
     # from the node's own payload or internal state.  Each call to
     # stream() must return an independent generator so the same node
     # can be iterated more than once.
 
-    class InternalNode(StreamMixin, Node):
+    class InternalNode(Stream, Node):
         def stream(self, data: Optional[bytes] = None) -> Iterator[Node]:
             for v in self.get("vals", ()):
                 yield Node({"val": v})
@@ -107,13 +107,13 @@ def run() -> Tuple[int, int]:
           "stream() on node with no entries yields nothing")
 
     # ------------------------------------------------------------------
-    heading("StreamMixin: with data (data=bytes)")
+    heading("Stream: with data (data=bytes)")
     # ------------------------------------------------------------------
     # When bytes are provided, the implementation parses them to produce
     # children.  Different payloads must produce different child sets,
     # and passing None vs bytes must dispatch to distinct behaviour.
 
-    class BytesNode(StreamMixin, Node):
+    class BytesNode(Stream, Node):
         def stream(self, data: Optional[bytes] = None) -> Iterator[Node]:
             if data is None:
                 return
@@ -146,7 +146,7 @@ def run() -> Tuple[int, int]:
           "stream(data=b'') yields nothing")
 
     # ------------------------------------------------------------------
-    heading("StreamMixin: laziness - nodes created only on consumption")
+    heading("Stream: laziness - nodes created only on consumption")
     # ------------------------------------------------------------------
     # stream() must be a generator: child nodes are constructed only as
     # the caller advances the iterator.  Verified by tracking
@@ -155,7 +155,7 @@ def run() -> Tuple[int, int]:
 
     construction_log: List[int] = []
 
-    class TrackedNode(StreamMixin, Node):
+    class TrackedNode(Stream, Node):
         def stream(self, data: Optional[bytes] = None) -> Iterator[Node]:
             for i in range(5):
                 construction_log.append(i)
@@ -176,14 +176,14 @@ def run() -> Tuple[int, int]:
           "second next() constructs exactly one more node")
 
     # ------------------------------------------------------------------
-    heading("StreamMixin: early exit - partial consumption is safe")
+    heading("Stream: early exit - partial consumption is safe")
     # ------------------------------------------------------------------
     # Breaking out of the loop before exhausting stream() must not
     # cause any error, and the node must remain fully usable afterwards.
 
     exit_log: List[int] = []
 
-    class ExitNode(StreamMixin, Node):
+    class ExitNode(Stream, Node):
         def stream(self, data: Optional[bytes] = None) -> Iterator[Node]:
             for i in range(100):
                 exit_log.append(i)
@@ -204,11 +204,11 @@ def run() -> Tuple[int, int]:
           "node remains usable after partial stream consumption")
 
     # ------------------------------------------------------------------
-    heading("StreamMixin: re-entrancy - two simultaneous generators")
+    heading("Stream: re-entrancy - two simultaneous generators")
     # ------------------------------------------------------------------
     # Two generators from the same node must advance independently.
 
-    class CountingNode(StreamMixin, Node):
+    class CountingNode(Stream, Node):
         def stream(self, data: Optional[bytes] = None) -> Iterator[Node]:
             for i in range(4):
                 yield Node({"i": i})
@@ -227,13 +227,13 @@ def run() -> Tuple[int, int]:
           "second generator starts at position 0 regardless of first")
 
     # ------------------------------------------------------------------
-    heading("StreamMixin: cascading streams (recursive lazy load)")
+    heading("Stream: cascading streams (recursive lazy load)")
     # ------------------------------------------------------------------
     # Children yielded by stream() can themselves be streamed, building
     # the tree level by level.  No children exist until stream() is
     # called; the caller drives population by iterating level by level.
 
-    class LevelNode(StreamMixin, Node):
+    class LevelNode(Stream, Node):
         ## @brief Node that streams a fixed number of child LevelNodes.
 
         def stream(self, data: Optional[bytes] = None) -> Iterator[Node]:
@@ -264,13 +264,13 @@ def run() -> Tuple[int, int]:
           "level-2 nodes have no further children")
 
     # ------------------------------------------------------------------
-    heading("StreamMixin: tree-walk + stream (canonical usage pattern)")
+    heading("Stream: tree-walk + stream (canonical usage pattern)")
     # ------------------------------------------------------------------
     # Walk the static _children skeleton with _tree_iter(), call
     # stream() on each node, and collect all dynamically-discovered
     # children.  This is how a caller populates the full tree on demand.
 
-    class ContainerNode(StreamMixin, Node):
+    class ContainerNode(Stream, Node):
         ## @brief Static parent node holding sub-containers.
         _children = ("subnodes",)
 
@@ -278,7 +278,7 @@ def run() -> Tuple[int, int]:
             for name in self.get("names", ()):
                 yield LeafNode({"name": name})
 
-    class LeafNode(StreamMixin, Node):
+    class LeafNode(Stream, Node):
         ## @brief Dynamically-discovered leaf node with no further children.
 
         def stream(self, data: Optional[bytes] = None) -> Iterator[Node]:

@@ -1,7 +1,7 @@
 ## @file test_serial.py
 ##
 ## @brief Unit tests for the ``Serialisable`` mixin and
-##        ``SerialisableNodeList``.
+##        ``SerialisableList``.
 ##
 ## Sections:
 ##
@@ -15,20 +15,20 @@
 ##     preservation, non-dict argument rejection, and the wrapped
 ##     ``TypeError`` produced when ``__init__`` itself raises.
 ##   - **clone** — scalar copy, deep Node copy, distinct references,
-##     shared-reference memo preservation, and ``SerialisableNodeList``
+##     shared-reference memo preservation, and ``SerialisableList``
 ##     type preservation (regression for the bug where clone() silently
 ##     demoted NodeList to a plain list).
 ##   - **_restore_via_payload** — bypass-``__init__`` path.
-##   - **_from_payload + ReadWriteMixin** — regression for the bug
+##   - **_from_payload + WriteMutex** — regression for the bug
 ##     where _from_payload omitted _rw_lock initialisation.
 ##   - **_restore_children** — None snapshot and unknown-field
 ##     edge cases.
-##   - **SerialisableNodeList** — snapshot, restore (including the
+##   - **SerialisableList** — snapshot, restore (including the
 ##     fallback path when item_type has no restore()), to_pretty_json,
 ##     and empty-list edge cases.
 ##   - **disk round-trip** — full JSON serialise-to-file and
 ##     restore-from-file cycle covering scalars, booleans, a child Node,
-##     and a SerialisableNodeList.
+##     and a SerialisableList.
 ##
 ## @copyright Copyright (c) 2026 Tim Hosking
 ## @see https://github.com/munger
@@ -52,9 +52,9 @@ for _d in (_PKG_DIR, _ROOT_DIR):
 from node_x import (
     Node,
     NodeList,
-    ReadWriteMixin,
+    WriteMutex,
     Serialisable,
-    SerialisableNodeList,
+    SerialisableList,
 )
 
 from _helpers import (
@@ -126,14 +126,14 @@ def run() -> Tuple[int, int]:
     # to define its own field ordering.
 
     n = SerNode({"a": 1, "b": "two"})
-    snap = n.snapshot()
+    snap = n.serialise(deep=True)
     check(passed, failed, snap["a"] == 1 and snap["b"] == "two",
           "snapshot contains all scalar fields")
 
     child = SerNode({"x": 10})
     parent = SerNode({"label": "root"})
     parent["child"] = child
-    snap = parent.snapshot()
+    snap = parent.serialise(deep=True)
     check(passed, failed,
           snap["child"] == {"x": 10},
           "snapshot recurses into child Nodes")
@@ -141,7 +141,7 @@ def run() -> Tuple[int, int]:
     # Build a node where a nested field comes first in insertion order
     # so we can verify that snapshot() moves it after the scalars.
     mixed = SerNode({"z_nested": SerNode({"deep": 1}), "a_scalar": 42, "b_scalar": "hi"})
-    snap_mixed = mixed.snapshot()
+    snap_mixed = mixed.serialise(deep=True)
     keys = list(snap_mixed.keys())
     scalar_idx = max(keys.index("a_scalar"), keys.index("b_scalar"))
     nested_idx = keys.index("z_nested")
@@ -170,8 +170,8 @@ def run() -> Tuple[int, int]:
     # the error with a hint about _restore_via_payload.
 
     n = SerNode({"a": 1, "b": "two"})
-    snap = n.snapshot()
-    restored = SerNode.restore(snap)
+    snap = n.serialise(deep=True)
+    restored = SerNode.deserialise(snap)
     check(passed, failed, restored["a"] == 1 and restored["b"] == "two",
           "restore reconstructs node from snapshot")
     check(passed, failed, isinstance(restored, SerNode),
@@ -179,10 +179,10 @@ def run() -> Tuple[int, int]:
 
     msg = check_catch(passed, failed,
                       "restore(42) raises TypeError",
-                      TypeError, lambda: SerNode.restore(42))
+                      TypeError, lambda: SerNode.deserialise(42))
     check(passed, failed,
-          "expected a mapping" in msg and "int" in msg and "snapshot" in msg,
-          "restore type message says 'mapping', names type, mentions snapshot()")
+          "expected a mapping" in msg and "int" in msg and "serialise" in msg,
+          "restore type message says 'mapping', names type, mentions serialise()")
 
     # When __init__ raises TypeError the error must be re-raised with a
     # message that points the developer to _restore_via_payload.
@@ -193,10 +193,10 @@ def run() -> Tuple[int, int]:
     msg = check_catch(passed, failed,
                       "restore() wraps __init__ TypeError",
                       TypeError,
-                      lambda: BadInitNode.restore({"a": 1}))
+                      lambda: BadInitNode.deserialise({"a": 1}))
     check(passed, failed,
-          "restore()" in msg and "_restore_via_payload" in msg,
-          "wrapped restore error mentions restore() and _restore_via_payload")
+          "deserialise()" in msg and "restore_via_payload" in msg,
+          "wrapped restore error mentions deserialise() and restore_via_payload")
 
     # ------------------------------------------------------------------
     heading("Serialisable: clone")
@@ -204,8 +204,8 @@ def run() -> Tuple[int, int]:
     # clone() produces a deep copy of the node tree using __new__ +
     # dict.__init__ to avoid calling __init__ (which may have side
     # effects).  Shared Node references within the tree must map to
-    # the same clone via the memo dict.  SerialisableNodeList values
-    # must be cloned as SerialisableNodeList, not demoted to plain list
+    # the same clone via the memo dict.  SerialisableList values
+    # must be cloned as SerialisableList, not demoted to plain list
     # (regression guard for the clone() NodeList bug).
 
     child = SerNode({"x": (1, 2, 3)})
@@ -228,27 +228,27 @@ def run() -> Tuple[int, int]:
     check(passed, failed, cloned_shared["a"] is cloned_shared["b"],
           "clone preserves shared Node references via memo")
 
-    # SerialisableNodeList must survive clone() with its type intact.
-    class RWSerNode(ReadWriteMixin, Serialisable, Node):
+    # SerialisableList must survive clone() with its type intact.
+    class RWSerNode(WriteMutex, Serialisable, Node):
         pass
 
     rw_src = RWSerNode({"v": 1})
     rw_clone = rw_src.clone()
     check(passed, failed, rw_src._rw_lock is not rw_clone._rw_lock,
-          "clone gives ReadWriteMixin node a fresh _rw_lock (not shared)")
+          "clone gives WriteMutex node a fresh _rw_lock (not shared)")
 
-    nl_orig = SerialisableNodeList([SerNode({"i": 0}), SerNode({"i": 1})])
+    nl_orig = SerialisableList([SerNode({"i": 0}), SerNode({"i": 1})])
     parent_nl = SerNode({"label": "with-list"})
     parent_nl["kids"] = nl_orig
     cloned_nl = parent_nl.clone()
-    check(passed, failed, isinstance(cloned_nl["kids"], SerialisableNodeList),
-          "clone preserves SerialisableNodeList type (not plain list)")
+    check(passed, failed, isinstance(cloned_nl["kids"], SerialisableList),
+          "clone preserves SerialisableList type (not plain list)")
     check(passed, failed, len(cloned_nl["kids"]) == 2,
-          "cloned SerialisableNodeList has correct length")
+          "cloned SerialisableList has correct length")
     check(passed, failed, cloned_nl["kids"] is not nl_orig,
-          "cloned SerialisableNodeList is a distinct object")
+          "cloned SerialisableList is a distinct object")
     check(passed, failed, cloned_nl["kids"][0] is not nl_orig[0],
-          "cloned SerialisableNodeList elements are distinct objects")
+          "cloned SerialisableList elements are distinct objects")
 
     # ------------------------------------------------------------------
     heading("Serialisable: _restore_via_payload")
@@ -262,42 +262,42 @@ def run() -> Tuple[int, int]:
         _restore_via_payload = True
 
     original = PayloadNode({"a": 1})
-    snap = original.snapshot()
-    restored = PayloadNode.restore(snap)
+    snap = original.serialise(deep=True)
+    restored = PayloadNode.deserialise(snap)
     check(passed, failed, restored["a"] == 1,
           "_restore_via_payload restore works")
 
     # ------------------------------------------------------------------
-    heading("Serialisable: _from_payload initialises _rw_lock for ReadWriteMixin")
+    heading("Serialisable: _from_payload initialises _rw_lock for WriteMutex")
     # ------------------------------------------------------------------
-    # _from_payload() bypasses __init__, which means ReadWriteMixin.__init__
+    # _from_payload() bypasses __init__, which means WriteMutex.__init__
     # is never called.  The fix initialises _rw_lock explicitly when the
-    # class includes ReadWriteMixin in its MRO.  This test guards against
+    # class includes WriteMutex in its MRO.  This test guards against
     # regression: without the fix the first mutation on the restored node
     # raises AttributeError on _rw_lock.
 
-    class RWPayloadNode(ReadWriteMixin, Serialisable, Node):
+    class RWPayloadNode(WriteMutex, Serialisable, Node):
         _restore_via_payload = True
 
     rw_orig = RWPayloadNode({"x": 10})
-    rw_snap = rw_orig.snapshot()
-    rw_restored = RWPayloadNode.restore(rw_snap)
+    rw_snap = rw_orig.serialise(deep=True)
+    rw_restored = RWPayloadNode.deserialise(rw_snap)
     check_does_not_raise(passed, failed,
-                         "_from_payload + ReadWriteMixin: mutation does not raise",
+                         "_from_payload + WriteMutex: mutation does not raise",
                          lambda: rw_restored.__setitem__("y", 20))
     check(passed, failed, rw_restored["y"] == 20,
-          "_from_payload + ReadWriteMixin: write succeeds after restore")
+          "_from_payload + WriteMutex: write succeeds after restore")
 
     # ------------------------------------------------------------------
     heading("Serialisable: _restore_children edge cases")
     # ------------------------------------------------------------------
     # _restore_children() is a helper for custom restore() implementations.
     # It must silently skip when the snapshot is None and silently ignore
-    # keys that are not declared in _node_fields or _list_fields.
+    # keys that are not declared in node_fields or list_fields.
 
     class EmptyNode(Serialisable, Node):
-        _node_fields: Dict[str, Any] = {}
-        _list_fields: Dict[str, Any] = {}
+        node_fields: Dict[str, Any] = {}
+        list_fields: Dict[str, Any] = {}
 
     empty = EmptyNode()
     EmptyNode._restore_children(empty, None)
@@ -309,56 +309,56 @@ def run() -> Tuple[int, int]:
           "_restore_children with unknown fields is safe")
 
     # ------------------------------------------------------------------
-    heading("SerialisableNodeList: snapshot / restore")
+    heading("SerialisableList: snapshot / restore")
     # ------------------------------------------------------------------
     # snapshot() produces a list of plain dicts by calling snapshot()
-    # on each element.  restore() reconstructs elements via item_type.restore()
+    # on each element.  restore() reconstructs elements via item_type.deserialise()
     # if available, otherwise falls back to item_type(snap) directly.
     # Already-instantiated item_type instances must pass through unchanged.
 
     items = [SerNode({"i": 1}), SerNode({"i": 2})]
-    snl = SerialisableNodeList(items)
-    snapshots = snl.snapshot()
+    snl = SerialisableList(items)
+    snapshots = snl.serialise(deep=True)
     check(passed, failed, len(snapshots) == 2,
-          "SerialisableNodeList.snapshot returns list of snapshots")
+          "SerialisableList.snapshot returns list of snapshots")
 
-    restored_list = SerialisableNodeList.restore(snapshots, SerNode)
+    restored_list = SerialisableList.deserialise(snapshots, SerNode)
     check(passed, failed, len(restored_list) == 2,
-          "SerialisableNodeList.restore reconstructs elements")
+          "SerialisableList.restore reconstructs elements")
 
     # Already-instantiated instances must pass through the isinstance
     # check and not be re-constructed.
-    raw_list = SerialisableNodeList.restore([SerNode({"x": 1})], SerNode)
+    raw_list = SerialisableList.deserialise([SerNode({"x": 1})], SerNode)
     check(passed, failed, len(raw_list) == 1,
-          "SerialisableNodeList.restore passes through Node instances")
+          "SerialisableList.restore passes through Node instances")
 
     # ------------------------------------------------------------------
-    heading("SerialisableNodeList: to_pretty_json")
+    heading("SerialisableList: to_pretty_json")
     # ------------------------------------------------------------------
 
-    snl = SerialisableNodeList([SerNode({"a": 1})])
+    snl = SerialisableList([SerNode({"a": 1})])
     js = snl.to_pretty_json()
     parsed = json.loads(js)
     check(passed, failed, isinstance(parsed, list) and parsed[0]["a"] == 1,
-          "SerialisableNodeList.to_pretty_json works")
+          "SerialisableList.to_pretty_json works")
 
     # Empty list edge cases: snapshot and JSON serialisation must both
     # produce valid empty-list representations.
-    empty_snl = SerialisableNodeList()
-    check(passed, failed, empty_snl.snapshot() == [],
-          "SerialisableNodeList.snapshot on empty list returns []")
+    empty_snl = SerialisableList()
+    check(passed, failed, empty_snl.serialise(deep=True) == [],
+          "SerialisableList.snapshot on empty list returns []")
     check(passed, failed, json.loads(empty_snl.to_pretty_json()) == [],
-          "SerialisableNodeList.to_pretty_json on empty list returns '[]'")
+          "SerialisableList.to_pretty_json on empty list returns '[]'")
 
     # When item_type has no restore() method, restore() falls back to
     # calling item_type(snap) directly (the plain Node constructor path).
     class NoRestoreNode(Node):
         pass
 
-    snl_nr = SerialisableNodeList.restore([{"x": 1}], NoRestoreNode)
+    snl_nr = SerialisableList.deserialise([{"x": 1}], NoRestoreNode)
     check(passed, failed,
           len(snl_nr) == 1 and isinstance(snl_nr[0], NoRestoreNode),
-          "SerialisableNodeList.restore falls back to item_type(snap) when no restore()")
+          "SerialisableList.restore falls back to item_type(snap) when no restore()")
 
     # ------------------------------------------------------------------
     heading("Serialisable: clone on Serialisable subclass")
@@ -378,12 +378,12 @@ def run() -> Tuple[int, int]:
     # DiskNode demonstrates the canonical pattern for a Serialisable
     # subclass with typed children: use _restore_via_payload to load
     # scalar fields via _from_payload, then call _restore_children to
-    # rebuild the child Node and SerialisableNodeList.
+    # rebuild the child Node and SerialisableList.
 
     class DiskNode(Serialisable, Node):
         ## @brief Node with custom restore that reconstructs children from a snapshot.
         ##
-        ## Declares ``_node_fields`` and ``_list_fields`` so ``_restore_children``
+        ## Declares ``node_fields`` and ``list_fields`` so ``_restore_children``
         ## can rebuild child Nodes and NodeLists from plain dicts.  Sets
         ## ``_restore_via_payload = True`` to bypass ``__setitem__`` validation
         ## during construction (the raw snapshot dict is loaded directly).
@@ -391,8 +391,8 @@ def run() -> Tuple[int, int]:
         ## The custom ``restore()`` is the intended pattern for any Serialisable
         ## subclass with children: construct from payload, then restore children.
 
-        _node_fields = {"sub": SerNode}
-        _list_fields = {"child_nodes": (SerialisableNodeList, SerNode)}
+        node_fields = {"sub": SerNode}
+        list_fields = {"child_nodes": (SerialisableList, SerNode)}
         _restore_via_payload = True
 
         @classmethod
@@ -418,14 +418,14 @@ def run() -> Tuple[int, int]:
     })
     child = SerNode({"id": 1, "label": "leaf"})
     original["sub"] = child
-    items = SerialisableNodeList([
+    items = SerialisableList([
         SerNode({"idx": 0}),
         SerNode({"idx": 1}),
     ])
     original["child_nodes"] = items
 
     # Phase 1 — snapshot tree to JSON and write to /tmp.
-    snap = original.snapshot()
+    snap = original.serialise(deep=True)
     js = json.dumps(snap, indent=2)
 
     tmp = tempfile.NamedTemporaryFile(
@@ -439,7 +439,7 @@ def run() -> Tuple[int, int]:
         with open(tmp.name) as f:
             restored_data = json.load(f)
 
-        restored = DiskNode.restore(restored_data)
+        restored = DiskNode.deserialise(restored_data)
 
         # Phase 3 — verify every field, type, and identity constraint.
         check(passed, failed, isinstance(restored, DiskNode),
@@ -457,7 +457,7 @@ def run() -> Tuple[int, int]:
         check(passed, failed, restored["sub"]["label"] == "leaf",
               "restored child node label matches")
         check(passed, failed, isinstance(restored["child_nodes"],
-                                         SerialisableNodeList),
+                                         SerialisableList),
               "restored node list is NodeList instance")
         check(passed, failed, len(restored["child_nodes"]) == 2,
               "restored node list has correct length")

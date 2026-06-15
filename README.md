@@ -1,27 +1,64 @@
 # Node-X
 
 A composable graph object model for Python — serialisable, streamable,
-persistent, and thread-safe — with zero core dependencies.
+and thread-safe — with zero core dependencies.
 
 Tree libraries are common. Node-X is something else: a complete object model
-for building, transmitting, and persisting typed graphs at runtime. A node
-graph can be constructed, walked, mutated under concurrent access, frozen into
-an immutable snapshot, serialised to JSON, YAML, or SQLite, sent over any
-wire — REST, sockets, queues, whatever you have — and restored on the other
-end as a fully typed, immediately operational object graph. Restored graphs
-can be grafted onto live trees, streamed for lazy population, frozen as trust
-boundaries, or cached locally across process restarts. The core library ships
-as a single file with no dependencies beyond the Python standard library.
+for building, transmitting, and persisting typed graphs at runtime.
+
+- **Graph identity preserved across serialisation round-trips.** Any node
+  carrying a `_key` is serialised once in full; every subsequent reference
+  becomes `{"$ref": key}`. `deserialise()` resolves all markers back to the
+  *same* Python object — a node shared by multiple parents is one object in
+  memory, not a copy per parent, after a JSON or YAML round-trip.
+
+- **Typed graph containers with two-pass deserialise.** `Graph` subclasses
+  declare their node collections via `list_fields`. On restore, all nodes are
+  pre-registered before any reference is resolved, so cross-type links and
+  forward references both work regardless of the order they appear in the
+  snapshot.
+
+- **Thread-safe mutations and deadlock-free multi-node locking.** Every Node
+  and NodeList mutation acquires a per-instance `RLock` automatically.
+  `Transaction` acquires multiple locks in `id()`-sorted order, eliminating
+  ABBA deadlock. `WriteMutex` adds a readers-writer lock for safe iteration
+  under concurrent writes, with no changes required in writer code.
+
+- **Full typed round-trips.** `serialise(deep=True)` produces a plain
+  JSON-safe dict/list tree. `deserialise()` rebuilds the full typed graph,
+  reconstructing `node_fields` and `list_fields` children as their correct
+  subclasses automatically.
+
+- **Lazy streaming.** `Stream.stream()` yields child nodes on demand —
+  children are constructed only as the caller iterates. Combine with
+  `_tree_iter()` for level-by-level population of live trees from remote or
+  expensive sources.
+
+- **Payload validation and reserved-name protection.** Every write is checked
+  against a safe type whitelist. Method names, properties, and annotated
+  fields are automatically reserved, so incoming data can never clobber class
+  structure.
+
+- **Deep freeze and thaw.** `freeze()` makes a node and its entire subtree
+  immutable in one call; every mutation raises `TypeError` until `thaw()`.
+
+- **Recursive merge.** `merge()` deep-merges a mapping into the node tree —
+  scalars are overwritten, nested Nodes are merged recursively. Returns `self`
+  for chaining.
+
+- **Zero core dependencies.** The core node model is a single file
+  (`node_x.py`) with no dependencies beyond the Python standard library.
+  Optional companions add YAML serialisation (`node_x_yaml`) and a
+  fetch-and-cache protocol (`node_x_cache`) — bring only what you need.
 
 ```python
-from node_x import Node, NodeList, Serialisable, GraphMixin, NodeTransaction, ReadWriteMixin
+from node_x import Node, NodeList, Serialisable, Graph, Transaction, WriteMutex
 ```
 
-Two optional companion modules extend the core with zero additional friction:
+An optional companion module extends the core with zero additional friction:
 
 ```python
 import node_x.node_x_yaml                          # YAML serialisation — pip install node-x[yaml]
-from node_x.node_x_sqlite import NodeDB, DBMixin   # SQLite persistence — pip install node-x[sqlite]
 ```
 
 ---
@@ -37,9 +74,8 @@ from node_x.node_x_sqlite import NodeDB, DBMixin   # SQLite persistence — pip 
 - [Freeze and thaw](#freeze-and-thaw)
 - [Merge](#merge)
 - [Serialisation](#serialisation)
-- [Graph identity](#graph-identity)
+- [Graph](#graph)
 - [YAML](#yaml)
-- [SQLite persistence](#sqlite-persistence)
 - [Streaming](#streaming)
 - [Thread safety](#thread-safety)
 - [Class reference](#class-reference)
@@ -58,17 +94,10 @@ For YAML serialisation:
 pip install node-x[yaml]
 ```
 
-For SQLite persistence:
-
-```
-pip install node-x[sqlite]
-```
-
-Or copy `node_x/node_x.py` (and any companion modules you need from the same
-directory) directly into your project — the core has no dependencies beyond
-the Python standard library, and `node_x_sqlite` uses only `sqlite3` which
-is also stdlib. In standalone mode the files are imported by their filename:
-`import node_x`, `import node_x_sqlite`, `import node_x_yaml`.
+Or copy `node_x/node_x.py` (and `node_x_yaml.py` if needed) directly into
+your project — the core has no dependencies beyond the Python standard
+library. In standalone mode the files are imported by their filename:
+`import node_x`, `import node_x_yaml`.
 
 ---
 
@@ -356,59 +385,62 @@ node = Node({"a": 1}).merge({"b": 2}).merge({"c": 3})
 
 ## Serialisation
 
-Mix in `Serialisable` to add snapshot/restore/clone to any Node subclass.
+Mix in `Serialisable` to add serialise/deserialise/clone to any Node subclass.
 
 ```python
-from node_x import Node, NodeList, Serialisable, SerialisableNodeList
+from node_x import Node, Serialisable, SerialisableList
 import json
 
 class Tag(Serialisable, Node):
     pass
 
 class Article(Serialisable, Node):
-    _children = ("tags",)
+    restore_via_payload = True
+    node_fields  = {"author": "Person"}   # populated after forward ref resolves
+    list_fields  = {"tags": (SerialisableList, Tag)}
 ```
 
-### Snapshot and restore
+### Serialise and deserialise
 
 ```python
 article = Article({"title": "Deep Dive", "views": 1200})
-article["tags"] = SerialisableNodeList([Tag({"name": "python"})])
+article["tags"] = SerialisableList([Tag({"name": "python"})])
 
-# Snapshot to plain Python (JSON-safe)
-snap = article.snapshot()
+# Deep snapshot — plain Python, JSON-safe, scalars before nested structures
+snap = article.serialise(deep=True)
 # {'title': 'Deep Dive', 'views': 1200, 'tags': [{'name': 'python'}]}
-#  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  scalars first, nested after
 
 # Pretty JSON
 print(article.to_pretty_json())
 
 # Restore from snapshot
-restored = Article.restore(snap)
+restored = Article.deserialise(snap)
 print(restored["title"])   # Deep Dive
+```
+
+`restore_via_payload = True` bypasses `__init__` during deserialise, which is
+the right choice when `__init__` has side effects. Declare `node_fields` and
+`list_fields` to have `deserialise()` reconstruct typed children automatically:
+
+```python
+class Person(Serialisable, Node):
+    restore_via_payload = True
+
+class Article(Serialisable, Node):
+    restore_via_payload = True
+    node_fields = {"author": Person}
+    list_fields = {"tags": (SerialisableList, Tag)}
+
+restored = Article.deserialise(snap)
+print(isinstance(restored["author"], Person))          # True
+print(isinstance(restored["tags"], SerialisableList))  # True
 ```
 
 ### Disk round-trip
 
-For nodes with typed children, define a custom `restore()` that uses
-`_from_payload` + `_restore_children`:
-
-```python
-class Article(Serialisable, Node):
-    _node_fields  = {"author": Person}
-    _list_fields  = {"tags": (SerialisableNodeList, Tag)}
-    _restore_via_payload = True
-
-    @classmethod
-    def restore(cls, snapshot):
-        node = cls._from_payload(snapshot)
-        cls._restore_children(node, snapshot)
-        return node
-```
-
 ```python
 # Write to disk
-snap = article.snapshot()
+snap = article.serialise(deep=True)
 with open("article.json", "w") as f:
     json.dump(snap, f, indent=2)
 
@@ -416,9 +448,7 @@ with open("article.json", "w") as f:
 with open("article.json") as f:
     data = json.load(f)
 
-restored = Article.restore(data)
-print(isinstance(restored["author"], Person))   # True
-print(isinstance(restored["tags"], SerialisableNodeList))  # True
+restored = Article.deserialise(data)
 ```
 
 ### Clone
@@ -435,94 +465,133 @@ copy["title"] = "Copy"
 print(original["title"])   # Original — unaffected
 ```
 
----
+### `$ref` — shared nodes in plain trees
 
-## Graph identity
-
-Mix in `GraphMixin` to give a Node subclass a class-level registry. Every call
-to `get_or_create()` with the same key returns the *same* Python object,
-regardless of how many traversal paths discover it. This is what makes a true
-graph rather than a tree: a node shared by multiple parents is one object in
-memory, not one copy per parent.
+Any node that carries a `_key` payload field is treated as an addressable
+node. `to_plain()` emits the full dict the first time it encounters such a
+node and `{"$ref": key}` on every subsequent encounter. `deserialise()`
+resolves `$ref` markers back to the same Python object, preserving identity
+across round-trips.
 
 ```python
-from node_x import Node, GraphMixin
+alice = Person({"_key": "alice", "name": "Alice"})
 
-class PersonNode(GraphMixin, Node):
-    pass
-
-a = PersonNode.get_or_create("user-42", {"name": "Alice"})
-b = PersonNode.get_or_create("user-42")
-
-assert a is b           # True — same instance every time
-assert a["name"] == "Alice"
-```
-
-Keys must be strings — they are stored as `_key` in the node payload and used
-as `$ref` targets during serialisation.
-
-### Graph-aware serialisation
-
-`Serialisable.to_plain()` understands `GraphMixin` nodes. The first time a
-keyed node is encountered in a depth-first walk it is emitted in full; every
-subsequent reference becomes a `{"$ref": key}` marker. `restore()` resolves
-all `$ref` markers back to the original shared instance, preserving true graph
-identity across serialisation round-trips.
-
-```python
-from node_x import Node, GraphMixin, Serialisable, SerialisableNodeList
-
-class PersonNode(GraphMixin, Serialisable, Node):
-    _restore_via_payload = True
-
-class DocumentNode(Serialisable, Node):
-    _restore_via_payload = True
-    _node_fields = {"author": PersonNode}
-
-class Corpus(Serialisable, Node):
-    _restore_via_payload = True
-    _list_fields = {"documents": (SerialisableNodeList, DocumentNode)}
-
-PersonNode.clear_registry()
-alice = PersonNode.get_or_create("user-42", {"name": "Alice"})
-
-doc_a = DocumentNode({"title": "Introduction"})
-doc_b = DocumentNode({"title": "Advanced Topics"})
+doc_a = Article({"title": "Introduction"})
+doc_b = Article({"title": "Advanced Topics"})
 doc_a["author"] = alice
 doc_b["author"] = alice   # same object — one author, two documents
 
 corpus = Corpus({})
-corpus["documents"] = SerialisableNodeList([doc_a, doc_b])
+corpus["documents"] = SerialisableList([doc_a, doc_b])
 
-# Second author reference becomes {"$ref": "user-42"} in the snapshot
-snap = corpus.snapshot()
+snap = corpus.serialise(deep=True)
+# doc_b's author appears as {"$ref": "alice"} — not a duplicate full dict
 
-# Restore — both documents point to the same PersonNode instance
-restored = Corpus.restore(snap)
+restored = Corpus.deserialise(snap)
 docs = restored["documents"]
-assert docs[0]["author"] is docs[1]["author"]   # True
+assert docs[0]["author"] is docs[1]["author"]   # True — same Python object
+
+docs[0]["author"]["name"] = "Alice Smith"
+print(docs[1]["author"]["name"])   # Alice Smith — mutation visible everywhere
 ```
 
-### Visited flag
+---
 
-`is_known` / `mark_known()` provide a lightweight BFS visited flag, useful
-when streaming a graph and you need to avoid expanding a node more than once:
+## Graph
+
+`Graph` is a `Serialisable, Node` that acts as a typed, namespaced container
+for other nodes. Declare `list_fields` on a subclass to specify which node
+types the graph holds. The graph's own `_key` becomes a namespace prefix for
+every node it contains.
 
 ```python
-node = PersonNode.get_or_create("user-42")
+from node_x import Graph, Node, Serialisable, SerialisableList
 
-if not node.is_known:
-    node.mark_known()
-    for child in node.stream():
-        ...
+class ArtistNode(Serialisable, Node):
+    restore_via_payload = True
+
+class ReleaseNode(Serialisable, Node):
+    restore_via_payload = True
+    node_fields = {"artist": ArtistNode}
+
+class MusicGraph(Graph):
+    list_fields = {
+        "artists":  (SerialisableList, ArtistNode),
+        "releases": (SerialisableList, ReleaseNode),
+    }
 ```
 
-Call `clear_registry()` between independent runs to prevent stale instances
-from a previous session being returned:
+### Building a graph
 
 ```python
-PersonNode.clear_registry()
+g = MusicGraph({"_key": "uk"})
+
+beatles = g.ensure(ArtistNode, "beatles", name="The Beatles")
+ppm     = g.ensure(ReleaseNode, "ppm", title="Please Please Me")
+
+# Nodes carry their fully-qualified key
+print(beatles["_key"])   # uk/beatles
+print(ppm["_key"])       # uk/ppm
+
+# Link a release to its artist
+ppm["artist"] = beatles
+
+# ensure returns the same instance for the same key
+assert g.ensure(ArtistNode, "beatles") is beatles   # True
 ```
+
+### Serialise and deserialise
+
+```python
+snap = g.serialise(deep=True)
+# ppm's artist field becomes {"$ref": "uk/beatles"} in the snapshot
+
+restored = MusicGraph.deserialise(snap)
+r_release = restored["releases"][0]
+r_artist  = restored["artists"][0]
+
+assert r_release["artist"] is r_artist   # True — cross-type ref preserved
+r_artist["name"] = "The Beatles (early)"
+print(r_release["artist"]["name"])   # The Beatles (early)
+```
+
+`Graph.deserialise()` uses a two-pass approach: it pre-registers all nodes
+from every `list_fields` collection before resolving any `$ref`. This means
+cross-type references and forward references both work regardless of the order
+nodes appear in the snapshot.
+
+### Nested graphs and prefix composition
+
+A `Graph` can contain other `Graph` nodes. Child graph keys compose naturally
+with the parent prefix:
+
+```python
+class RegionGraph(Graph):
+    list_fields = {"artists": (SerialisableList, ArtistNode)}
+
+class WorldGraph(Graph):
+    list_fields = {"regions": (SerialisableList, RegionGraph)}
+
+world = WorldGraph({"_key": "charts"})
+uk    = world.ensure(RegionGraph, "uk")
+
+print(uk["_key"])   # charts/uk
+
+beatles = uk.ensure(ArtistNode, "beatles")
+print(beatles["_key"])   # charts/uk/beatles
+```
+
+### add()
+
+Use `add()` to register a node you created outside `ensure()`. The
+node's `_key` must already be the fully-qualified form:
+
+```python
+node = ArtistNode({"_key": "uk/stones", "name": "The Rolling Stones"})
+g.add(node)
+```
+
+`add()` raises `TypeError` if the node's type is not declared in `list_fields`.
 
 ---
 
@@ -535,19 +604,19 @@ PersonNode.clear_registry()
 import node_x.node_x_yaml as node_x_yaml
 
 # Serialise
-text = node_x_yaml.dump(timeline)
+text = node_x_yaml.dump(graph)
 
 # Restore
-restored = node_x_yaml.load(Timeline, text)
+restored = node_x_yaml.load(MusicGraph, text)
 ```
 
 `dump()` defaults to block YAML (one key per line, human-readable and
 diffable). Pass `default_flow_style=True` for compact inline notation.
 Non-ASCII characters are written as literal UTF-8 — no escape sequences.
 
-`$ref` graph markers are round-tripped correctly: a shared node serialised
-with `{"$ref": "key"}` in the YAML restores to a single shared Python object,
-preserving graph identity exactly as JSON does.
+`$ref` markers are round-tripped correctly: a shared node serialised as
+`{"$ref": "key"}` in YAML restores to a single shared Python object, preserving
+identity exactly as JSON does.
 
 ```python
 # Block style (default) — readable, diffable
@@ -559,136 +628,23 @@ text = node_x_yaml.dump(node, default_flow_style=True)
 
 ---
 
-## SQLite persistence
-
-`node_x_sqlite` is a companion module that stores node snapshots in a local
-SQLite database. It uses `sqlite3` from the standard library — no extra
-packages are required.
-
-```python
-from node_x.node_x_sqlite import NodeDB, DBMixin
-```
-
-### NodeDB
-
-`NodeDB` is a thread-safe store keyed by `(class_name, key)`. Each calling
-thread gets its own connection; WAL journal mode allows multiple threads to
-read simultaneously.
-
-```python
-db = NodeDB("cache.db")
-
-# Save any Serialisable node
-db.save(node, key="config")        # explicit key
-db.save(graph_node)                # auto-key from node["_key"] (GraphMixin)
-
-# Restore — returns None on cache miss
-cached = db.load(PersonNode, "user-42")
-if cached is None:
-    cached = PersonNode.get_or_create("user-42", fetch_from_api("user-42"))
-    db.save(cached)
-
-# Inspect the cache
-db.keys(PersonNode)    # ['user-1', 'user-2', 'user-42', ...]
-db.count(PersonNode)   # 3
-db.count()             # total rows across all classes
-
-# Remove entries
-db.delete(PersonNode, "user-42")   # one entry
-db.clear(PersonNode)               # all entries for this class
-db.clear()                         # everything
-
-# Context manager — closes the calling thread's connection on exit
-with NodeDB("cache.db") as db:
-    db.save(node, key="config")
-```
-
-### DBMixin
-
-Mix `DBMixin` into a node class to get `db_save`, `db_load`, and `db_delete`
-without constructing the `NodeDB` path yourself. The database is always passed
-explicitly so nodes remain decoupled from any specific file path.
-
-```python
-from node_x import Node, GraphMixin, Serialisable, StreamMixin
-from node_x.node_x_sqlite import NodeDB, DBMixin
-
-class PersonNode(DBMixin, GraphMixin, Serialisable, StreamMixin, Node):
-    _restore_via_payload = True
-
-    def stream(self, _data=None):
-        # Yield children on demand
-        ...
-
-db = NodeDB("people.db")
-
-# Instance methods
-alice = PersonNode.get_or_create("user-42", {"name": "Alice"})
-alice.db_save(db)                          # saves under alice["_key"]
-alice.db_delete(db)                        # removes the entry
-
-# Class method
-alice = PersonNode.db_load("user-42", db)  # None on miss
-```
-
-### Persistence and graph identity
-
-`NodeDB` uses `node.snapshot()` for serialisation — the same format as JSON
-and YAML. Graph `$ref` markers are round-tripped correctly: a shared
-`GraphMixin` node serialised with `{"$ref": "key"}` in the snapshot restores
-as a single shared Python object, preserving graph identity exactly as a
-JSON or YAML round-trip does.
-
-```python
-alice = PersonNode.get_or_create("user-42", {"name": "Alice"})
-
-# Two documents share the same author object
-doc_a["author"] = alice
-doc_b["author"] = alice
-
-db.save(corpus, key="corpus-1")
-restored = db.load(Corpus, "corpus-1")
-
-# Graph identity is preserved across the DB round-trip
-assert restored["documents"][0]["author"] is restored["documents"][1]["author"]
-```
-
-### Cache-aside pattern
-
-The typical pattern for expensive operations (HTTP, computation) is
-check-then-populate:
-
-```python
-node = PersonNode.get_or_create("user-42")
-
-# Try the cache first; fall back to live fetch on miss
-cached = db.load(PersonNode, "user-42")
-if cached is not None:
-    node["profile"] = cached.get("profile")
-else:
-    node["profile"] = fetch_profile("user-42")
-    db.save(node)
-```
-
----
-
 ## Streaming
 
-`StreamMixin` adds lazy child discovery to a Node. Override `stream()` to
+`Stream` adds lazy child discovery to a Node. Override `stream()` to
 yield children on demand — they are constructed only as the caller iterates,
 making it ideal for large or remote data sources.
 
 ```python
-from node_x import Node, StreamMixin
+from node_x import Node, Stream
 
-class DirectoryNode(StreamMixin, Node):
+class DirectoryNode(Stream, Node):
     def stream(self, data=None):
         import os
         for entry in os.scandir(self["path"]):
             yield FileNode({"name": entry.name, "path": entry.path,
                             "is_dir": entry.is_dir()})
 
-class FileNode(StreamMixin, Node):
+class FileNode(Stream, Node):
     def stream(self, data=None):
         # Leaf nodes yield nothing by default
         return
@@ -708,7 +664,7 @@ for entry in root.stream():
 Pass pre-fetched bytes to avoid repeated I/O:
 
 ```python
-class CsvNode(StreamMixin, Node):
+class CsvNode(Stream, Node):
     def stream(self, data=None):
         if data is None:
             return
@@ -728,7 +684,7 @@ for child in node.stream(data=payload):
 Combine `_tree_iter()` with `stream()` to populate a tree level by level:
 
 ```python
-class Container(StreamMixin, Node):
+class Container(Stream, Node):
     _children = ("sections",)   # static children
 
     def stream(self, data=None):
@@ -736,7 +692,7 @@ class Container(StreamMixin, Node):
         for name in self.get("items", ()):
             yield Item({"name": name})
 
-class Item(StreamMixin, Node):
+class Item(Stream, Node):
     pass
 
 root = Container({"items": ("a", "b")})
@@ -789,21 +745,21 @@ with node.lock:
     node["counter"] = node["counter"] + 1
 ```
 
-### Cross-node operations — `NodeTransaction`
+### Cross-node operations — `Transaction`
 
 When you need to read from one node and write to another atomically, use
-`NodeTransaction`. It acquires all locks in `id()`-sorted order, which
+`Transaction`. It acquires all locks in `id()`-sorted order, which
 prevents ABBA deadlock regardless of how many concurrent transactions are
 in flight.
 
 ```python
-from node_x import Node, NodeTransaction
+from node_x import Node, Transaction
 
 account_a = Node({"balance": 1000})
 account_b = Node({"balance": 500})
 
 def transfer(src, dst, amount):
-    with NodeTransaction(src, dst):
+    with Transaction(src, dst):
         if src["balance"] >= amount:
             src["balance"] -= amount
             dst["balance"] += amount
@@ -820,22 +776,22 @@ for t in threads:
     t.join()
 ```
 
-`NodeTransaction` works with any mix of `Node` and `NodeList` instances.
+`Transaction` works with any mix of `Node` and `NodeList` instances.
 
-### Safe iteration — `ReadWriteMixin`
+### Safe iteration — `WriteMutex`
 
 By default, iterating a NodeList while another thread mutates it is not
-protected. Mix in `ReadWriteMixin` to get a `reading()` context that
+protected. Mix in `WriteMutex` to get a `reading()` context that
 blocks writers until iteration completes — with no changes required in
 writer code:
 
 ```python
-from node_x import Node, NodeList, ReadWriteMixin
+from node_x import Node, NodeList, WriteMutex
 
-class LiveList(ReadWriteMixin, NodeList):
+class LiveList(WriteMutex, NodeList):
     pass
 
-class LiveNode(ReadWriteMixin, Node):
+class LiveNode(WriteMutex, Node):
     pass
 
 queue = LiveList()
@@ -854,17 +810,17 @@ Multiple concurrent readers are allowed simultaneously. The write lock is
 re-entrant for the same thread, so methods that call other mutating methods
 internally (such as `merge()` calling `__setitem__`) do not deadlock.
 
-`ReadWriteMixin` is compatible with both `Node` and `NodeList`, and with
-`NodeTransaction`:
+`WriteMutex` is compatible with both `Node` and `NodeList`, and with
+`Transaction`:
 
 ```python
-class SafeNode(ReadWriteMixin, Node):
+class SafeNode(WriteMutex, Node):
     pass
 
 a = SafeNode({"x": 1})
 b = SafeNode({"y": 2})
 
-with NodeTransaction(a, b):
+with Transaction(a, b):
     a["x"] = b["y"]   # safe: write guards acquired for both nodes
 ```
 
@@ -876,33 +832,19 @@ with NodeTransaction(a, b):
 |---|---|---|
 | `Node` | `dict` | Thread-safe dict-backed node; per-instance `RLock`, payload validation, freeze/thaw, merge, tree walking |
 | `NodeList` | `list` | Thread-safe Node-only collection; mirrors full `list` API |
-| `GraphMixin` | — | Per-class registry for true graph identity; `get_or_create()`, `clear_registry()`, `is_known`, `mark_known()` |
-| `StreamMixin` | — | Adds `stream(data=None)` virtual method for lazy child discovery |
-| `Serialisable` | — | Mixin adding `snapshot()`, `restore()`, `clone()`, `to_plain()`, `to_pretty_json()`; graph-aware `$ref` serialisation when combined with `GraphMixin` |
-| `SerialisableNodeList` | `NodeList` | NodeList with `snapshot()`, `restore()`, `to_pretty_json()` |
-| `NodeTransaction` | — | Context manager; acquires multiple Node/NodeList locks in deadlock-free order |
-| `ReadWriteMixin` | — | Opt-in readers-writer lock; `reading()` context blocks writers during safe iteration |
+| `Stream` | — | Adds `stream(data=None)` virtual method for lazy child discovery |
+| `Serialisable` | — | Mixin adding `serialise()`, `deserialise()`, `clone()`, `to_plain()`, `to_pretty_json()`; `$ref` deduplication for any node carrying `_key` |
+| `SerialisableList` | `NodeList` | NodeList with `serialise()`, `deserialise()`, `to_pretty_json()` |
+| `Graph` | `Serialisable, Node` | Typed, namespaced container; `ensure()`, `add()`; two-pass `deserialise()` for cross-type `$ref` resolution |
+| `Transaction` | — | Context manager; acquires multiple Node/NodeList locks in deadlock-free order |
+| `WriteMutex` | — | Opt-in readers-writer lock; `reading()` context blocks writers during safe iteration |
 
 ### node_x_yaml
 
 | Function | Purpose |
 |---|---|
 | `dump(node, *, default_flow_style=False, indent=2)` | Serialise a `Serialisable` node tree to a YAML string |
-| `load(cls, text)` | Reconstruct a node tree from a YAML string via `cls.restore()` |
-
-### node_x_sqlite
-
-| Class / Method | Purpose |
-|---|---|
-| `NodeDB(path)` | Open (or create) a SQLite database for node snapshot storage |
-| `NodeDB.save(node, key=None)` | Persist a snapshot; auto-key from `node["_key"]` if present |
-| `NodeDB.load(cls, key)` | Restore a node, or return `None` on cache miss |
-| `NodeDB.delete(cls, key)` | Remove a single entry |
-| `NodeDB.clear(cls=None)` | Remove all entries for a class, or everything |
-| `NodeDB.keys(cls)` | Sorted list of stored keys for a class |
-| `NodeDB.count(cls=None)` | Row count for a class, or total |
-| `NodeDB.close()` | Close the calling thread's connection |
-| `DBMixin` | Mixin adding `db_save(db)`, `db_load(key, db)`, `db_delete(db)` to a node class |
+| `load(cls, text)` | Reconstruct a node tree from a YAML string via `cls.deserialise()` |
 
 ### Payload type whitelist
 

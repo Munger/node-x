@@ -10,9 +10,9 @@
 ##   - **full round-trip: simple** — dump → load cycle on a flat node and
 ##     a two-level tree; verifies type and field fidelity.
 ##   - **full round-trip: graph $ref** — dump → load cycle on a graph
-##     containing a shared keyed (``GraphMixin``) node; verifies that both
+##     containing a shared keyed (``Graph``) node; verifies that both
 ##     references restore to the *same* Python object (true graph identity).
-##   - **full round-trip: SerialisableNodeList** — list containing a
+##   - **full round-trip: SerialisableList** — list containing a
 ##     shared node deduplicates to ``$ref`` in YAML and restores identity.
 ##   - **unicode** — non-ASCII artist names survive dump → load without
 ##     escape sequences.
@@ -40,10 +40,9 @@ for _d in (_PKG_DIR, _ROOT_DIR):
 import yaml as _yaml
 
 from node_x import (
-    GraphMixin,
     Node,
     Serialisable,
-    SerialisableNodeList,
+    SerialisableList,
 )
 import node_x.node_x_yaml as node_x_yaml
 
@@ -71,25 +70,25 @@ class ChildNode(Serialisable, Node):
 class TreeNode(Serialisable, Node):
     ## @brief Two-level tree: one scalar child Node and one NodeList.
     _restore_via_payload = True
-    _node_fields  = {"leaf": ChildNode}
-    _list_fields  = {"leaves": (SerialisableNodeList, ChildNode)}
+    node_fields  = {"leaf": ChildNode}
+    list_fields  = {"leaves": (SerialisableList, ChildNode)}
 
 
-class GNode(GraphMixin, Serialisable, Node):
-    ## @brief Graph node — carries ``_key`` for $ref deduplication.
+class GNode(Serialisable, Node):
+    ## @brief Keyed node — carries ``_key`` for $ref deduplication.
     _restore_via_payload = True
 
 
 class Container(Serialisable, Node):
     ## @brief Holds two named references to the same GNode.
     _restore_via_payload = True
-    _node_fields = {"ref_a": GNode, "ref_b": GNode}
+    node_fields = {"ref_a": GNode, "ref_b": GNode}
 
 
 class ListContainer(Serialisable, Node):
     ## @brief Holds a NodeList that may contain duplicate GNode entries.
     _restore_via_payload = True
-    _list_fields = {"entries": (SerialisableNodeList, GNode)}
+    list_fields = {"entries": (SerialisableList, GNode)}
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +98,7 @@ class ListContainer(Serialisable, Node):
 def run() -> Tuple[int, int]:
     ## @brief Execute all node_x_yaml test sections and return pass/fail counts.
     ##
-    ## Each section that uses GraphMixin calls ``clear_registry()`` in a
+    ## Each section that uses Graph calls ``clear_registry()`` in a
     ## try/finally block so that registry state never leaks between sections.
     ##
     ## @return ``(pass_count, fail_count)`` across all sections.
@@ -164,7 +163,7 @@ def run() -> Tuple[int, int]:
     # ------------------------------------------------------------------
 
     leaf   = ChildNode({"id": 7, "label": "leaf-node"})
-    leaves = SerialisableNodeList([ChildNode({"id": i}) for i in range(3)])
+    leaves = SerialisableList([ChildNode({"id": i}) for i in range(3)])
     tree   = TreeNode({"name": "root"})
     tree["leaf"]   = leaf
     tree["leaves"] = leaves
@@ -180,7 +179,7 @@ def run() -> Tuple[int, int]:
           "nested child field survives round-trip")
     check(passed, failed, restored2["leaf"]["label"] == "leaf-node",
           "nested child string field survives round-trip")
-    check(passed, failed, isinstance(restored2["leaves"], SerialisableNodeList),
+    check(passed, failed, isinstance(restored2["leaves"], SerialisableList),
           "NodeList type is preserved after YAML round-trip")
     check(passed, failed, len(restored2["leaves"]) == 3,
           "NodeList length preserved after round-trip")
@@ -195,65 +194,55 @@ def run() -> Tuple[int, int]:
     # serialise to a $ref in YAML and restore back to a single shared
     # Python object — not two independent copies.
 
-    GNode.clear_registry()
-    try:
-        shared  = GNode.get_or_create("artist-1", {"name": "The Beatles"})
-        wrapper = Container({})
-        wrapper["ref_a"] = shared
-        wrapper["ref_b"] = shared
+    shared  = GNode({"_key": "artist-1", "name": "The Beatles"})
+    wrapper = Container({})
+    wrapper["ref_a"] = shared
+    wrapper["ref_b"] = shared
 
-        text3 = node_x_yaml.dump(wrapper)
+    text3 = node_x_yaml.dump(wrapper)
 
-        # The YAML must contain a $ref entry for the second reference.
-        check(passed, failed, "$ref" in text3,
-              "YAML output contains a $ref marker for the shared node")
-        check(passed, failed, "artist-1" in text3,
-              "YAML output contains the shared node key")
+    # The YAML must contain a $ref entry for the second reference.
+    check(passed, failed, "$ref" in text3,
+          "YAML output contains a $ref marker for the shared node")
+    check(passed, failed, "artist-1" in text3,
+          "YAML output contains the shared node key")
 
-        restored3 = node_x_yaml.load(Container, text3)
+    restored3 = node_x_yaml.load(Container, text3)
 
-        check(passed, failed,
-              isinstance(restored3["ref_a"], GNode),
-              "first reference restores as GNode instance")
-        check(passed, failed,
-              restored3["ref_a"] is restored3["ref_b"],
-              "both references restore to the same Python object (graph identity)")
-        check(passed, failed,
-              restored3["ref_a"]["name"] == "The Beatles",
-              "shared node payload survives YAML round-trip")
+    check(passed, failed,
+          isinstance(restored3["ref_a"], GNode),
+          "first reference restores as GNode instance")
+    check(passed, failed,
+          restored3["ref_a"] is restored3["ref_b"],
+          "both references restore to the same Python object (graph identity)")
+    check(passed, failed,
+          restored3["ref_a"]["name"] == "The Beatles",
+          "shared node payload survives YAML round-trip")
 
-        # Mutation through one reference must be visible via the other.
-        restored3["ref_a"]["name"] = "Beatles"
-        check(passed, failed,
-              restored3["ref_b"]["name"] == "Beatles",
-              "mutation via one reference is visible through the other after YAML restore")
-
-    finally:
-        GNode.clear_registry()
+    # Mutation through one reference must be visible via the other.
+    restored3["ref_a"]["name"] = "Beatles"
+    check(passed, failed,
+          restored3["ref_b"]["name"] == "Beatles",
+          "mutation via one reference is visible through the other after YAML restore")
 
     # ------------------------------------------------------------------
     heading("node_x_yaml: full round-trip — graph $ref in NodeList")
     # ------------------------------------------------------------------
 
-    GNode.clear_registry()
-    try:
-        item       = GNode.get_or_create("item-1", {"tag": "shared"})
-        list_root  = ListContainer({})
-        list_root["entries"] = SerialisableNodeList([item, item])
+    item       = GNode({"_key": "item-1", "tag": "shared"})
+    list_root  = ListContainer({})
+    list_root["entries"] = SerialisableList([item, item])
 
-        text4 = node_x_yaml.dump(list_root)
-        check(passed, failed, "$ref" in text4,
-              "YAML list output contains a $ref for the duplicated entry")
+    text4 = node_x_yaml.dump(list_root)
+    check(passed, failed, "$ref" in text4,
+          "YAML list output contains a $ref for the duplicated entry")
 
-        restored4 = node_x_yaml.load(ListContainer, text4)
-        check(passed, failed, len(restored4["entries"]) == 2,
-              "list length preserved after YAML round-trip")
-        check(passed, failed,
-              restored4["entries"][0] is restored4["entries"][1],
-              "list entries that were the same object restore as the same object")
-
-    finally:
-        GNode.clear_registry()
+    restored4 = node_x_yaml.load(ListContainer, text4)
+    check(passed, failed, len(restored4["entries"]) == 2,
+          "list length preserved after YAML round-trip")
+    check(passed, failed,
+          restored4["entries"][0] is restored4["entries"][1],
+          "list entries that were the same object restore as the same object")
 
     # ------------------------------------------------------------------
     heading("node_x_yaml: unicode — non-ASCII strings survive round-trip")
@@ -301,17 +290,13 @@ def run() -> Tuple[int, int]:
 
     class OrphanRoot(Serialisable, Node):
         _restore_via_payload = True
-        _node_fields = {"child": GNode}
+        node_fields = {"child": GNode}
 
-    GNode.clear_registry()
-    try:
-        msg_orphan = catch_into(passed, failed,
-                                "load with orphaned $ref raises KeyError",
-                                KeyError,
-                                lambda: node_x_yaml.load(OrphanRoot, orphan_yaml))
-        check(passed, failed, "ghost-key" in msg_orphan,
-              "KeyError message contains the missing $ref key")
-    finally:
-        GNode.clear_registry()
+    msg_orphan = catch_into(passed, failed,
+                            "load with orphaned $ref raises KeyError",
+                            KeyError,
+                            lambda: node_x_yaml.load(OrphanRoot, orphan_yaml))
+    check(passed, failed, "ghost-key" in msg_orphan,
+          "KeyError message contains the missing $ref key")
 
     return len(passed), len(failed)

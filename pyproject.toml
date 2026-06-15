@@ -12,7 +12,7 @@ license = {text = "MIT"}
 authors = [
     {name = "Tim Hosking", email = "munger@mungerware.com"}
 ]
-keywords = ["node", "graph", "tree", "serialisable", "streaming", "thread-safe", "distributed"]
+keywords = ["node", "graph", "tree", "object-model", "serialisation", "graph-identity", "streaming", "thread-safe", "typed", "ref"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "License :: OSI Approved :: MIT License",
@@ -32,5 +32,4 @@ Homepage = "https://github.com/Munger/node-x"
 packages = ["node_x"]
 
 [project.optional-dependencies]
-yaml   = ["pyyaml>=6.0"]
-sqlite = []
+yaml = ["pyyaml>=6.0"]

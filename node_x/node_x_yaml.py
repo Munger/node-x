@@ -3,7 +3,7 @@
 ## @brief YAML serialisation companion for node_x.
 ##
 ## Provides ``dump()`` and ``load()`` that map directly onto
-## ``Serialisable.to_plain()`` / ``Serialisable.restore()`` so callers
+## ``Serialisable.to_plain()`` / ``Serialisable.deserialise()`` so callers
 ## get YAML in, YAML out without touching the core library.
 ##
 ## This is a standalone module — import it alongside node_x.py with no
@@ -23,7 +23,7 @@
 ## multi-line strings cleanly, and supports inline comments (though
 ## ``dump()`` does not emit them).  For machine-to-machine transport or
 ## storage where file size matters, JSON is preferable — use
-## ``Serialisable.to_pretty_json()`` or ``json.dumps(node.snapshot())``.
+## ``Serialisable.to_pretty_json()`` or ``json.dumps(node.serialise(deep=True))``.
 ##
 ## @copyright Copyright (c) 2026 Tim Hosking
 ## @see https://github.com/Munger/node-x
@@ -69,7 +69,7 @@ def dump(node: Any, *, default_flow_style: bool = False, indent: int = 2) -> str
     ## @brief Serialise a Serialisable node tree to a YAML string.
     ##
     ## Calls ``node.to_plain()`` to produce a plain Python structure (with
-    ## ``$ref`` markers for GraphMixin cross-references) and then passes
+    ## ``$ref`` markers for Graph cross-references) and then passes
     ## that to ``yaml.dump()``.  The result is a portable YAML document that
     ## can be stored, diffed, or passed to ``load()``.
     ##
@@ -100,18 +100,18 @@ def load(cls: Type[T], text: str) -> T:
     ##
     ## Parses *text* with ``yaml.safe_load()`` (no Python-object tags, no
     ## arbitrary code execution) and passes the resulting plain structure to
-    ## ``cls.restore()``.  ``$ref`` markers in the YAML are resolved during
+    ## ``cls.deserialise()``.  ``$ref`` markers in the YAML are resolved during
     ## restore exactly as they would be from a JSON round-trip.
     ##
     ## @param cls   The ``Serialisable`` subclass to restore as (e.g. Timeline).
     ## @param text  YAML document string produced by ``dump()`` or by hand.
     ## @return A fully reconstructed instance of *cls*.
     ## @raise yaml.YAMLError  If *text* is not valid YAML.
-    ## @raise TypeError       If *cls* does not have a ``restore()`` classmethod.
+    ## @raise TypeError       If *cls* does not have a ``deserialise()`` classmethod.
     ## @raise KeyError        If a ``$ref`` in the YAML cannot be resolved.
 
     plain = yaml.safe_load(text)
     # safe_load is mandatory — never use yaml.load() with untrusted input.
     # It produces only Python dicts, lists, strings, ints, floats, bools,
-    # and None, which is exactly what restore() expects.
-    return cls.restore(plain)
+    # and None, which is exactly what deserialise() expects.
+    return cls.deserialise(plain)

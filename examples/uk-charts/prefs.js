@@ -46,8 +46,6 @@ const DEFAULTS = {
     velocityDecay:  0.4,    // friction applied each tick; higher = nodes stop faster
     centerStrength: 0.02,   // gentle pull toward canvas centre — keeps graph from drifting off-screen
     chargeDistMax:  800,    // beyond this distance nodes stop repelling each other
-    angleStrength:  8,      // stiffness of the angular spring holding temporal nodes on their spoke
-    radialStrength: 0.25,   // stiffness of the radial spring — lower than angle so nodes can breathe
     nudgeBatch:     20,     // how many nodes to add before rebinding the simulation
     nudgeAlpha:     0.3,    // alpha is capped at this floor on nudge so the sim never fully cools mid-expansion
     dragAlpha:      0.3,    // alpha injected when the user releases a dragged node

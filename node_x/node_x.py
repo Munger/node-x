@@ -12,12 +12,13 @@
 ##     Node                    — dict-backed, RLock, payload validation,
 ##                               freeze/thaw, subtree walking, merging
 ##     NodeList                — thread-safe Node-only collection
-##     StreamMixin             — virtual stream() for lazy child discovery
-##     GraphMixin              — per-class registry for true graph identity
-##     Serialisable            — snapshot/restore/clone mixin
-##     SerialisableNodeList    — NodeList + snapshot/restore
-##     NodeTransaction         — ordered multi-node lock acquisition
-##     ReadWriteMixin          — opt-in readers-writer lock for safe iteration
+##     Stream                  — virtual stream() for lazy child discovery
+##     Graph                   — instance-scoped typed-collection node with
+##                               two-pass cross-reference deserialisation
+##     Serialisable            — serialise/deserialise/clone mixin
+##     SerialisableList        — NodeList + serialise/deserialise
+##     Transaction             — ordered multi-node lock acquisition
+##     WriteMutex              — opt-in readers-writer lock for safe iteration
 ##
 ## Thread-safety contract
 ## ======================
@@ -30,7 +31,7 @@
 ## state.  The same applies to all ``NodeList`` mutations (``append``,
 ## ``extend``, ``insert``, ``pop``, ``remove``, ``clear``, ``reverse``,
 ## ``sort``, ``__setitem__``, ``__delitem__``, ``freeze``, ``thaw``) and
-## to the ``Serialisable.to_plain()`` / ``snapshot()`` /
+## to the ``Serialisable.to_plain()`` / ``serialise()`` /
 ## ``to_pretty_json()`` family.  Subclasses inherit this protection
 ## automatically for any fields written via normal attribute or item
 ## assignment.
@@ -46,7 +47,7 @@
 ##     v = node["counter"]
 ##     node["counter"] = v + 1
 ##
-## Subclasses that need safe iteration can opt into ``ReadWriteMixin``,
+## Subclasses that need safe iteration can opt into ``WriteMutex``,
 ## which makes writers block transparently while a ``reading()`` context
 ## is active — no special handling required in writer code::
 ##
@@ -60,10 +61,10 @@
 ## on each method.
 ##
 ## **Cross-node operations** — reading from one node and writing to
-## another is not atomic.  Use ``NodeTransaction`` to acquire all
+## another is not atomic.  Use ``Transaction`` to acquire all
 ## relevant locks in a stable, deadlock-free order::
 ##
-##     with NodeTransaction(node_a, node_b):
+##     with Transaction(node_a, node_b):
 ##         val = node_a["x"]        # read
 ##         node_b["y"] = val        # write
 ##
@@ -75,7 +76,7 @@
 ##         v = node["counter"]      # read
 ##         node["counter"] = v + 1  # write
 ##
-## ``NodeTransaction`` acquires locks in ``id()``-sorted order and
+## ``Transaction`` acquires locks in ``id()``-sorted order and
 ## therefore avoids ABBA deadlock between concurrent acquisitions on
 ## different node pairs.
 ##
@@ -134,7 +135,7 @@ T = TypeVar("T", bound="Node")
 
 
 class _RWLock:
-    ## @brief Readers-writer lock used internally by ``ReadWriteMixin``.
+    ## @brief Readers-writer lock used internally by ``WriteMutex``.
     ##
     ## Multiple concurrent readers are allowed simultaneously.  A writer
     ## blocks until every active reader has exited.  The write side is
@@ -228,7 +229,7 @@ class Node(dict):
     ## that add public methods or properties do not need to maintain
     ## ``_reserved`` manually.
     ##
-    ## ``_children`` is a tuple of attribute names whose values are
+    ## ``children`` is a tuple of attribute names whose values are
     ## Node or NodeList instances that form the structural tree.
     ## ``_tree_iter()`` walks these names to yield the full subtree.
     ## ``_walk_child_nodes()`` applies a callable to every descendant.
@@ -256,7 +257,7 @@ class Node(dict):
         ## @brief Collect reserved attribute names for each subclass.
         ##
         ## Walks the MRO and collects every public (non-underscore) name
-        ## defined as a method, class attribute (except ``_children`` and
+        ## defined as a method, class attribute (except ``children`` and
         ## ``_reserved`` themselves), or annotated field.  These are added
         ## to ``_reserved`` so that ``__setattr__`` routes them to
         ## ``object.__setattr__`` rather than the dict payload.
@@ -330,7 +331,7 @@ class Node(dict):
     def _write_guard(self) -> Iterator[None]:
         ## @brief Context manager acquired before every mutation.
         ##
-        ## The base implementation is a no-op; ``ReadWriteMixin``
+        ## The base implementation is a no-op; ``WriteMutex``
         ## overrides it to block writers while a ``reading()`` context
         ## is active.  All mutation methods acquire ``_write_guard``
         ## *before* ``_lock`` to preserve a consistent lock ordering and
@@ -344,7 +345,7 @@ class Node(dict):
     def lock(self) -> threading.RLock:
         ## @brief Expose the instance RLock for external callers.
         ##
-        ## Used by ``NodeTransaction`` and any code that needs to hold
+        ## Used by ``Transaction`` and any code that needs to hold
         ## locks across multiple nodes.
         ##
         ## @return The per-instance ``threading.RLock``.
@@ -377,7 +378,7 @@ class Node(dict):
         ## and checking the frozen flag.
         ##
         ## ``_write_guard`` is acquired before ``_lock`` to maintain the
-        ## consistent lock ordering required by ``ReadWriteMixin``.
+        ## consistent lock ordering required by ``WriteMutex``.
         ##
         ## @param name   The attribute name.
         ## @param value  The value to store.
@@ -523,8 +524,8 @@ class Node(dict):
         ## Plain ``list`` and ``dict`` are permitted for storing inline
         ## data records (e.g. a list of chart-position dicts).  They are
         ## serialised correctly by ``to_plain()`` and restored verbatim
-        ## by ``_from_payload()``; ``_restore_children()`` only
-        ## reconstructs fields declared in ``_list_fields``/``_node_fields``
+        ## by ``from_payload()``; ``_restore_children()`` only
+        ## reconstructs fields declared in ``list_fields``/``node_fields``
         ## so plain data fields are never mistaken for child nodes.
         ##
         ## Thread-safety note: the node's ``_lock`` protects assignment
@@ -710,12 +711,12 @@ class Node(dict):
     def _tree_iter(self) -> Iterable[Node]:
         ## @brief Depth-first generator over this node and its children.
         ##
-        ## Walks all attributes named in ``_children`` recursively.
+        ## Walks all attributes named in ``children`` recursively.
         ## Each node (including self) is yielded exactly once.
         ##
         ## @warning Not thread-safe.  No locks are acquired during
         ##          traversal.  Concurrent structural modifications
-        ##          (reassigning ``_children`` tuples or the child
+        ##          (reassigning ``children`` tuples or the child
         ##          or reassigning child attributes) can cause nodes to
         ##          be skipped or visited twice.  Confine tree walks to
         ##          a single thread, or freeze the tree first.
@@ -793,7 +794,7 @@ class NodeList(list, Generic[T]):
     def _write_guard(self) -> Iterator[None]:
         ## @brief Context manager acquired before every mutation.
         ##
-        ## The base implementation is a no-op; ``ReadWriteMixin``
+        ## The base implementation is a no-op; ``WriteMutex``
         ## overrides it to block writers while a ``reading()`` context
         ## is active.  All mutation methods acquire ``_write_guard``
         ## *before* ``_lock`` to preserve a consistent lock ordering.
@@ -807,7 +808,7 @@ class NodeList(list, Generic[T]):
         ## @brief Expose the instance RLock for external callers.
         ##
         ## Mirrors the same property on ``Node``.  Used by
-        ## ``NodeTransaction`` and callers that need to hold the lock
+        ## ``Transaction`` and callers that need to hold the lock
         ## across multiple operations.
         ##
         ## @return The per-instance ``threading.RLock``.
@@ -994,11 +995,11 @@ class NodeList(list, Generic[T]):
 
 
 # ============================================================================
-# StreamMixin
+# Stream
 # ============================================================================
 
 
-class StreamMixin:
+class Stream:
     ## @brief Mixin that adds lazy child-discovery to a ``Node``.
     ##
     ## Callers walk the static tree skeleton via ``_tree_iter()`` and
@@ -1030,149 +1031,32 @@ class StreamMixin:
 
 
 # ============================================================================
-# GraphMixin
-# ============================================================================
-
-
-class GraphMixin:
-    ## @brief Mixin that gives a ``Node`` subclass a stable identity and a
-    ##        class-level registry, enabling true graph semantics.
-    ##
-    ## In a pure tree each ``stream()`` call constructs a fresh node instance.
-    ## When the same logical entity is reachable from multiple paths this leads
-    ## to duplicate objects, duplicate work, and inconsistent state.
-    ## ``GraphMixin`` resolves that: ``get_or_create()`` returns the *same*
-    ## instance for a given key regardless of which traversal path discovered
-    ## it, so mutations are immediately visible everywhere.
-    ##
-    ## Registry scope
-    ## --------------
-    ## Each concrete subclass gets its own registry dict, created lazily the
-    ## first time ``get_or_create()`` is called on that class.  The explicit
-    ## ``"_registry" not in cls.__dict__`` check prevents subclasses from
-    ## inheriting — and accidentally sharing — a parent class's registry.
-    ##
-    ## Usage::
-    ##
-    ##     class DocumentNode(GraphMixin, StreamMixin, Node):
-    ##         ...
-    ##
-    ##     a = DocumentNode.get_or_create("doc-42")
-    ##     b = DocumentNode.get_or_create("doc-42")
-    ##     assert a is b   # True — same instance
-    ##
-    ##     DocumentNode.clear_registry()   # reset between independent runs
-
-    @classmethod
-    def get_or_create(cls, key: str, defaults: Optional[Dict[str, Any]] = None) -> "Node":
-        ## @brief Return the canonical node for *key*, creating it if absent.
-        ##
-        ## The registry lives directly on the concrete class so each subclass
-        ## has an independent namespace.
-        ##
-        ## Keys must be strings because they are stored in the node payload as
-        ## ``_key`` and are used as the values of ``$ref`` markers during
-        ## serialisation.  Non-string keys (integers, tuples, etc.) would
-        ## silently corrupt JSON round-trips: JSON converts tuple keys to lists,
-        ## and YAML emits Python-specific tags that ``yaml.safe_load`` rejects.
-        ##
-        ## @param key       Unique identity string for this node.
-        ## @param defaults  Initial payload dict used *only* when creating a
-        ##                  new instance.  Ignored on cache hits.
-        ## @return The existing or newly-created node instance.
-        ## @raise TypeError  If *key* is not a ``str``.
-
-        if not isinstance(key, str):
-            raise TypeError(
-                f"{cls.__name__}.get_or_create() requires a str key; "
-                f"got {type(key).__name__} {key!r}. "
-                f"Keys are stored as _key in the node payload and used as "
-                f"$ref targets during serialisation — they must be strings "
-                f"so that JSON and YAML round-trips work correctly."
-            )
-
-        if "_registry" not in cls.__dict__:
-            cls._registry: Dict[str, Any] = {}
-
-        if key not in cls._registry:
-            node = cls(defaults or {})
-            node["_key"] = key
-            cls._registry[key] = node
-
-        return cls._registry[key]
-
-    @classmethod
-    def clear_registry(cls) -> None:
-        ## @brief Remove all entries from this class's registry.
-        ##
-        ## Call between independent runs to prevent stale instances from a
-        ## previous run being returned by ``get_or_create()``.
-        ##
-        ## @return None
-
-        if "_registry" in cls.__dict__:
-            cls._registry.clear()
-
-    @property
-    def graph_key(self) -> Optional[str]:
-        ## @brief The identity key this node was registered under, or ``None``
-        ##        if it was not created via ``get_or_create()``.
-        ##
-        ## @return The key string, or ``None``.
-
-        return self.get("_key")  # type: ignore[attr-defined]
-
-    @property
-    def is_known(self) -> bool:
-        ## @brief ``True`` if this node has been marked as visited.
-        ##
-        ## Set via ``mark_known()``.  Callers can check this flag before
-        ## calling ``stream()`` to distinguish a first visit from a
-        ## cross-reference to an already-expanded node.
-        ##
-        ## @return Boolean.
-
-        return bool(self.get("_known"))  # type: ignore[attr-defined]
-
-    def mark_known(self) -> None:
-        ## @brief Mark this node as visited.
-        ##
-        ## Call once per node, typically at the start of ``stream()`` after
-        ## the cache check and before any I/O, so that concurrent arrivals
-        ## at the same node observe the flag immediately.
-        ##
-        ## @return None
-
-        self["_known"] = True  # type: ignore[index]
-
-
-# ============================================================================
 # Serialisable
 # ============================================================================
 
 
 class Serialisable:
-    ## @brief Mixin that adds snapshot/restore/clone to a ``Node``.
+    ## @brief Mixin that adds serialise/deserialise/clone to a ``Node``.
     ##
     ## Snapshots are plain Python dict/list/scalar trees with no
     ## ``Node`` instances — they can be serialised to JSON, YAML,
-    ## msgpack, or any text/binary format and later restored into a
+    ## msgpack, or any text/binary format and later deserialised into a
     ## typed object graph.
     ##
     ## Subclasses opt into structured child restoration by setting
-    ## ``_node_fields`` and/or ``_list_fields``.  The default
-    ## ``restore()`` passes the snapshot dict as ``__init__`` kwargs
+    ## ``node_fields`` and/or ``list_fields``.  The default
+    ## ``deserialise()`` passes the snapshot dict as ``__init__`` kwargs
     ## which works for simple payload-only nodes.
 
-    _restore_via_payload: ClassVar[bool] = False
-    ## @brief If ``True``, ``restore()`` bypasses ``__init__`` and
-    ##        constructs via ``_from_payload()``.
+    restore_via_payload: ClassVar[bool] = False
+    ## @brief If ``True``, ``deserialise()`` bypasses ``__init__`` and
+    ##        constructs via ``from_payload()``.
 
-    _node_fields: ClassVar[Dict[str, Type[Any]]] = {}
+    node_fields: ClassVar[Dict[str, Type[Any]]] = {}
     ## @brief Mapping of field name → Node subclass for restoring
     ##        single-child attributes.
 
-    _list_fields: ClassVar[Dict[str, Tuple[Type[Any], Type[Any]]]] = {}
+    list_fields: ClassVar[Dict[str, Tuple[Type[Any], Type[Any]]]] = {}
     ## @brief Mapping of field name → (NodeList subclass, item Node
     ##        subclass) for restoring list-child attributes.
 
@@ -1183,15 +1067,15 @@ class Serialisable:
         ## Nested Nodes become dicts, lists remain lists, scalars pass
         ## through unmodified.
         ##
-        ## GraphMixin nodes carry a ``_key`` that makes them addressable
-        ## across multiple paths in a graph.  When such a node is
-        ## encountered for the first time it is serialised in full; on
-        ## every subsequent encounter a ``{"$ref": key}`` marker is emitted
-        ## instead.  ``restore()`` resolves these markers back to live Node
+        ## Any node carrying a ``_key`` payload field is treated as an
+        ## addressable graph node.  When such a node is encountered for
+        ## the first time it is serialised in full; on every subsequent
+        ## encounter a ``{"$ref": key}`` marker is emitted instead.
+        ## ``deserialise()`` resolves these markers back to live Node
         ## objects using a shared registry built during deserialisation.
         ## Without this mechanism, nodes reachable via more than one path
         ## would be duplicated in the output and restored as independent
-        ## objects, silently breaking GraphMixin identity guarantees.
+        ## objects.
         ##
         ## @param _memo  Internal reference-tracking dict; callers should
         ##               omit this argument — it is initialised
@@ -1205,10 +1089,9 @@ class Serialisable:
 
         def convert(value: Any) -> Any:
             if isinstance(value, Node):
-                # GraphMixin nodes carry "_key"; use it to detect shared
-                # references.  The key is recorded *before* recursing so
-                # that self-referential structures terminate rather than
-                # looping indefinitely.
+                # Nodes carrying "_key" are addressable graph nodes; use
+                # it to detect shared references.  Record before recursing
+                # so self-referential structures terminate rather than loop.
                 node_key = value.get("_key")
                 if node_key is not None:
                     if node_key in _memo:
@@ -1235,7 +1118,7 @@ class Serialisable:
         ## @brief Return a JSON-serialisable representation of this node.
         ##
         ## When *deep* is ``True`` the full subtree is serialised
-        ## recursively (identical to the former ``snapshot()`` behaviour).
+        ## recursively (identical to ``serialise(deep=True)``).
         ##
         ## When *deep* is ``False`` (the default) only this node's own
         ## fields are included.  Child ``Node`` values are replaced by
@@ -1281,40 +1164,33 @@ class Serialisable:
 
         return {**scalars, **nested}
 
-    def snapshot(self) -> Any:
-        ## @brief Deep recursive snapshot of this node tree.
-        ##
-        ## Alias for ``serialise(deep=True)``.  Kept for backwards
-        ## compatibility — all existing callers continue to work unchanged.
-
-        return self.serialise(deep=True)
-
     @classmethod
-    def restore(
+    def deserialise(
         cls,
         snapshot: Any,
         _registry: Optional[Dict[str, Any]] = None,
     ) -> Any:
         ## @brief Rebuild a node (or subclass) from a snapshot.
         ##
-        ## If ``_restore_via_payload`` is ``True``, uses
-        ## ``_from_payload()`` to bypass ``__init__`` side effects.
+        ## If ``restore_via_payload`` is ``True``, uses
+        ## ``from_payload()`` to bypass ``__init__`` side effects.
         ## Otherwise passes the snapshot dict as ``__init__``'s
         ## single positional argument.
         ##
         ## ``$ref`` markers produced by ``to_plain()`` are resolved using
-        ## *_registry*, a shared ``key → node`` dict that is populated
-        ## incrementally as nodes are restored.  Because ``to_plain()``
-        ## always emits the full serialisation of a node before any
-        ## ``$ref`` pointing to it (depth-first order), the registry
-        ## always contains the target by the time the reference is
-        ## encountered — no forward-reference resolution is required.
+        ## *_registry*, a shared ``key → node`` dict threaded through all
+        ## recursive calls.  For plain ``Serialisable`` trees the registry
+        ## is populated depth-first as each full node dict is encountered,
+        ## which matches the order ``to_plain()`` emits them.  ``Graph``
+        ## overrides this method to run a pre-registration pass first so
+        ## that forward references and cross-type references between its
+        ## typed lists resolve correctly regardless of serialisation order.
         ##
         ## Callers should omit *_registry*; it is created automatically
         ## on the first call and threaded through all recursive calls by
-        ## ``_restore_children()`` and ``SerialisableNodeList.restore()``.
+        ## ``_restore_children()`` and ``SerialisableList.deserialise()``.
         ##
-        ## @param snapshot   Plain dict from an earlier ``snapshot()``.
+        ## @param snapshot   Plain dict from an earlier ``serialise(deep=True)``.
         ## @param _registry  Internal key→node registry; callers omit.
         ## @return A reconstructed ``Node`` subclass instance.
         ## @raise TypeError  If *snapshot* is not a dict.
@@ -1324,7 +1200,7 @@ class Serialisable:
             _registry = {}
 
         if isinstance(snapshot, dict):
-            # A $ref entry means this node was already restored earlier
+            # A $ref entry means this node was already deserialised earlier
             # in the same pass; return it directly rather than creating
             # a duplicate.
             ref = snapshot.get("$ref")
@@ -1333,56 +1209,63 @@ class Serialisable:
                 if node is None:
                     raise KeyError(
                         f"$ref {ref!r} cannot be resolved — the referenced "
-                        f"node has not been restored yet.  Ensure the "
+                        f"node has not been deserialised yet.  Ensure the "
                         f"snapshot was produced by to_plain() and that "
-                        f"restore() is called on the root node so the full "
+                        f"deserialise() is called on the root node so the full "
                         f"tree is traversed before any $ref is encountered."
                     )
                 return node
 
-            if getattr(cls, "_restore_via_payload", False):
-                node = cls._from_payload(snapshot)
+            # If Graph._preregister already created a skeleton for this key,
+            # reuse that instance and wire its children rather than creating
+            # a duplicate.
+            key = snapshot.get("_key")
+            if key is not None and key in _registry:
+                existing = _registry[key]
+                cls._restore_children(existing, snapshot, _registry=_registry)
+                return existing
+
+            if getattr(cls, "restore_via_payload", False):
+                node = cls.from_payload(snapshot)
             else:
                 try:
                     node = cls(snapshot)
                 except TypeError as exc:
                     raise TypeError(
-                        f"{cls.__name__}.restore() failed -- __init__ raised "
+                        f"{cls.__name__}.deserialise() failed -- __init__ raised "
                         f"{type(exc).__name__}({exc}). "
-                        f"Set _restore_via_payload = True if the snapshot "
+                        f"Set restore_via_payload = True if the snapshot "
                         f"already contains all fields, or provide a custom "
-                        f"restore() implementation."
+                        f"deserialise() implementation."
                     ) from exc
 
             # Register keyed nodes *before* recursing into children so
             # that any $ref pointing back to this node from a descendant
-            # (e.g. a release referencing its own week via chart_weeks)
             # resolves correctly.
-            key = snapshot.get("_key")
             if key is not None:
                 _registry[key] = node
 
-            # Always attempt child restoration; a no-op when _list_fields
-            # and _node_fields are both empty (the common case).
+            # Always attempt child restoration; a no-op when list_fields
+            # and node_fields are both empty (the common case).
             cls._restore_children(node, snapshot, _registry=_registry)
 
             return node
 
         raise TypeError(
-            f"{cls.__name__}.restore() expected a mapping (dict), "
+            f"{cls.__name__}.deserialise() expected a mapping (dict), "
             f"got {type(snapshot).__name__}. Snapshots are produced "
-            f"by calling snapshot() on a Node instance."
+            f"by calling serialise(deep=True) on a Node instance."
         )
 
     @classmethod
-    def _from_payload(cls, payload: Dict[str, Any]) -> Any:
+    def from_payload(cls, payload: Dict[str, Any]) -> Any:
         ## @brief Construct a node from a plain payload dict without
         ##        invoking ``__init__``.
         ##
         ## Creates the instance via ``__new__`` then initialises the
         ## dict portion via ``dict.__init__``, bypassing validation
         ## and side effects.  Safe because *payload* already came from
-        ## a ``snapshot()`` which has been validated.
+        ## a snapshot which has been validated.
         ##
         ## @param payload  Plain dict of field values.
         ## @return A new instance of ``cls``.
@@ -1391,7 +1274,7 @@ class Serialisable:
         dict.__init__(instance, payload)
         object.__setattr__(instance, "_lock", threading.RLock())
         object.__setattr__(instance, "_frozen", False)
-        if issubclass(cls, ReadWriteMixin):
+        if issubclass(cls, WriteMutex):
             object.__setattr__(instance, "_rw_lock", _RWLock())
         return instance
 
@@ -1404,19 +1287,19 @@ class Serialisable:
     ) -> None:
         ## @brief Rebuild declared child Nodes/NodeLists from a snapshot.
         ##
-        ## Subclasses opt in by populating ``_node_fields`` and/or
-        ## ``_list_fields``, then call this from their own ``restore()``
+        ## Subclasses opt in by populating ``node_fields`` and/or
+        ## ``list_fields``, then call this from their own ``deserialise()``
         ## after constructing *node*.
         ##
-        ## *_registry* is threaded through every recursive ``restore()``
-        ## and ``SerialisableNodeList.restore()`` call so that ``$ref``
+        ## *_registry* is threaded through every recursive ``deserialise()``
+        ## and ``SerialisableList.deserialise()`` call so that ``$ref``
         ## markers produced by ``to_plain()`` can be resolved against the
         ## partially-built tree.  Callers should pass the same registry
-        ## dict that was provided to the outer ``restore()`` call.
+        ## dict that was provided to the outer ``deserialise()`` call.
         ##
         ## @param node       The parent node whose children to restore.
         ## @param snapshot   Plain dict snapshot containing child data.
-        ## @param _registry  Shared key→node registry; pass from restore().
+        ## @param _registry  Shared key→node registry; pass from deserialise().
         ## @return None
 
         if not isinstance(snapshot, dict):
@@ -1427,20 +1310,20 @@ class Serialisable:
         if _registry is None:
             _registry = {}
 
-        for field, child_cls in getattr(cls, "_node_fields", {}).items():
+        for field, child_cls in getattr(cls, "node_fields", {}).items():
             raw = snapshot.get(field)
             if raw is not None:
-                setattr(node, field, child_cls.restore(raw, _registry=_registry))
+                setattr(node, field, child_cls.deserialise(raw, _registry=_registry))
 
         for field, (list_cls, item_cls) in getattr(
-            cls, "_list_fields", {}
+            cls, "list_fields", {}
         ).items():
             items = snapshot.get(field)
             if items is not None:
                 setattr(
                     node,
                     field,
-                    list_cls.restore(items, item_type=item_cls, _registry=_registry),
+                    list_cls.deserialise(items, item_type=item_cls, _registry=_registry),
                 )
 
     def clone(self) -> Any:
@@ -1517,12 +1400,12 @@ class Serialisable:
 
 
 # ============================================================================
-# SerialisableNodeList
+# SerialisableList
 # ============================================================================
 
 
-class SerialisableNodeList(NodeList[T], Generic[T]):
-    ## @brief A ``NodeList`` with snapshot/restore and pretty-printing.
+class SerialisableList(NodeList[T], Generic[T]):
+    ## @brief A ``NodeList`` with serialise/deserialise and pretty-printing.
     ##
     ## Provides the same serialisation interface as ``Serialisable``
     ## but for list-shaped collections of ``Node`` instances.
@@ -1531,8 +1414,7 @@ class SerialisableNodeList(NodeList[T], Generic[T]):
         ## @brief Return a JSON-serialisable list of this collection.
         ##
         ## When *deep* is ``True`` each element is serialised in full via
-        ## its own ``serialise(deep=True)`` (or ``snapshot()`` for types
-        ## that have not yet been updated).
+        ## its own ``serialise(deep=True)``.
         ##
         ## When *deep* is ``False`` (the default) each element is replaced
         ## by its plain ``_key`` string.  Elements without a ``_key`` are
@@ -1543,55 +1425,45 @@ class SerialisableNodeList(NodeList[T], Generic[T]):
 
         if deep:
             return [
-                getattr(item, "serialise", getattr(item, "snapshot", lambda **_: item))(deep=True)
-                if callable(getattr(item, "serialise", None))
-                else getattr(item, "snapshot", lambda: item)()
+                item.serialise(deep=True) if callable(getattr(item, "serialise", None)) else item
                 for item in self
             ]
         return [item for item in self if not isinstance(item, Node)]
 
-    def snapshot(self) -> Any:
-        ## @brief Deep recursive snapshot of this list.
-        ##
-        ## Alias for ``serialise(deep=True)``.  Kept for backwards
-        ## compatibility.
-
-        return self.serialise(deep=True)
-
     @classmethod
-    def restore(
+    def deserialise(
         cls,
         snapshots: Iterable[Any],
         item_type: type[T],
         _registry: Optional[Dict[str, Any]] = None,
-    ) -> SerialisableNodeList[T]:
-        ## @brief Rebuild a ``SerialisableNodeList`` from a list of
+    ) -> SerialisableList[T]:
+        ## @brief Rebuild a ``SerialisableList`` from a list of
         ##        element snapshots.
         ##
-        ## Each snapshot is restored via ``item_type.restore()``
+        ## Each snapshot is deserialised via ``item_type.deserialise()``
         ## (if available) or by passing it to ``item_type()`` directly.
         ## Already-instantiated ``item_type`` instances pass through.
         ##
-        ## *_registry* is forwarded to each ``item_type.restore()`` call
+        ## *_registry* is forwarded to each ``item_type.deserialise()`` call
         ## so that ``$ref`` markers within list items are resolved against
-        ## the same shared key→node table used by the parent restore pass.
+        ## the same shared key→node table used by the parent deserialise pass.
         ##
         ## @param snapshots  Iterable of snapshot dicts/scalars.
-        ## @param item_type  The ``Node`` subclass to restore each element as.
+        ## @param item_type  The ``Node`` subclass to deserialise each element as.
         ## @param _registry  Shared key→node registry; pass from the caller.
-        ## @return A reconstructed ``SerialisableNodeList``.
+        ## @return A reconstructed ``SerialisableList``.
 
         if _registry is None:
             _registry = {}
 
-        lst: SerialisableNodeList[T] = cls()
-        restore_func = getattr(item_type, "restore", None)
+        lst: SerialisableList[T] = cls()
+        deserialise_func = getattr(item_type, "deserialise", None)
         for snap in snapshots:
             if isinstance(snap, item_type):
                 lst.append(snap)
-            elif restore_func:
+            elif deserialise_func:
                 # Forward _registry so cross-list $refs resolve correctly.
-                lst.append(restore_func(snap, _registry=_registry))
+                lst.append(deserialise_func(snap, _registry=_registry))
             else:
                 lst.append(item_type(snap))
         return lst
@@ -1608,11 +1480,230 @@ class SerialisableNodeList(NodeList[T], Generic[T]):
 
 
 # ============================================================================
-# NodeTransaction
+# Graph
 # ============================================================================
 
 
-class NodeTransaction:
+class Graph(Serialisable, Node):
+    ## @brief Serialisable node that acts as a typed, namespaced container.
+    ##
+    ## A ``Graph`` owns collections of typed nodes declared in ``list_fields``.
+    ## Its ``_key`` serves as a namespace prefix for all nodes it contains:
+    ## a node with local key ``"b"`` inside a ``Graph`` keyed ``"a"``
+    ## is registered under ``"a/b"`` in the graph's runtime registry,
+    ## which is also the key stored in the node's own ``_key`` field.
+    ##
+    ## Nested ``Graph`` instances compose prefixes naturally: a child graph
+    ## with local key ``"sub"`` inside a graph keyed ``"root"`` is registered
+    ## as ``"root/sub"``, and nodes it creates become ``"root/sub/..."``.
+    ##
+    ## Two-pass ``deserialise()`` ensures that all nodes are registered before
+    ## any cross-reference (``$ref``) is resolved, enabling arbitrary cross-type
+    ## references between node collections without requiring a specific order.
+    ##
+    ## Subclasses declare which node types they contain via ``list_fields``::
+    ##
+    ##     class ProjectGraph(Graph):
+    ##         list_fields = {
+    ##             "authors": (SerialisableList, AuthorNode),
+    ##             "items":   (SerialisableList, ItemNode),
+    ##         }
+    ##
+    ##     g      = ProjectGraph({"_key": "proj"})
+    ##     author = g.ensure(AuthorNode, "alice", name="Alice")
+    ##     item   = g.ensure(ItemNode,   "task-1", title="First task")
+    ##     item["author"] = author
+
+    restore_via_payload: ClassVar[bool] = True
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        ## @brief Construct a ``Graph`` node and initialise the runtime registry.
+        ##
+        ## @param args    Optional initial payload dict; forwarded to ``Node``.
+        ## @param kwargs  Optional keyword payload fields; forwarded to ``Node``.
+
+        super().__init__(*args, **kwargs)
+        object.__setattr__(self, "_graph_registry", {})
+
+    @classmethod
+    def from_payload(cls, payload: Dict[str, Any]) -> Any:
+        ## @brief Bypass ``__init__`` during deserialise, then set ``_graph_registry``.
+        ##
+        ## @param payload  Plain snapshot dict.
+        ## @return A new ``Graph`` instance without invoking ``__init__`` side effects.
+
+        instance = super().from_payload(payload)
+        object.__setattr__(instance, "_graph_registry", {})
+        return instance
+
+    @property
+    def prefix(self) -> str:
+        ## @brief Namespace prefix for nodes in this graph.
+        ##
+        ## Equal to this graph's own ``_key``, or ``""`` when unset.
+        ## Nodes created via ``ensure()`` receive a ``_key`` of
+        ## ``"<prefix>/<local_key>"``.
+        ##
+        ## @return The prefix string; never ``None``.
+
+        return self.get("_key") or ""
+
+    def full_key(self, local_key: str) -> str:
+        ## @brief Return the fully-qualified registry key for *local_key*.
+        ##
+        ## @param local_key  The unprefixed identifier for a node in this graph.
+        ## @return ``"<prefix>/<local_key>"`` when a prefix is set, else *local_key*.
+
+        p = self.prefix
+        return f"{p}/{local_key}" if p else local_key
+
+    def ensure(self, cls: type, key: str, **kwargs: Any) -> Any:
+        ## @brief Return the registered node for *key*, or create and register one.
+        ##
+        ## The node's ``_key`` field is set to ``full_key(key)`` (the prefixed
+        ## form) so that ``to_plain()`` emits the correct ``$ref`` strings and
+        ## ``deserialise()`` resolves them against the same registry.
+        ##
+        ## @param cls     Node class to instantiate on a cache miss.
+        ## @param key     Local (un-prefixed) key within this graph.
+        ## @param kwargs  Initial payload fields forwarded to ``cls({...})``.
+        ## @return The existing or newly-created node.
+        ## @raise TypeError  If *key* is not a ``str`` or *cls* is not in
+        ##                   ``list_fields``.
+
+        if not isinstance(key, str):
+            raise TypeError(
+                f"{type(self).__name__}.ensure() requires a str key; "
+                f"got {type(key).__name__} {key!r}. "
+                f"Keys are stored as _key in node payloads and used as "
+                f"$ref targets during serialisation — non-string keys "
+                f"corrupt JSON and YAML round-trips."
+            )
+        fk = self.full_key(key)
+        if fk in self._graph_registry:
+            return self._graph_registry[fk]
+        node = cls({"_key": fk, **kwargs})
+        self.add(node)
+        return node
+
+    def add(self, node: Any) -> None:
+        ## @brief Register *node* in the appropriate typed list.
+        ##
+        ## Matches *node* against ``list_fields`` by isinstance check.
+        ## Appends to the matching ``SerialisableList`` (creating one if
+        ## absent) and indexes the node in ``_graph_registry`` by its
+        ## ``_key`` value (which must already be the fully-qualified key if
+        ## this graph has a prefix).
+        ##
+        ## @param node  A ``Node`` subclass instance.
+        ## @raise TypeError  If *node*'s type is not declared in ``list_fields``.
+
+        for field, (list_cls, item_cls) in type(self).list_fields.items():
+            if isinstance(node, item_cls):
+                lst = self.get(field)
+                if lst is None:
+                    lst = list_cls()
+                    self[field] = lst
+                lst.append(node)
+                node_key = node.get("_key")
+                if node_key:
+                    self._graph_registry[node_key] = node
+                return
+        raise TypeError(
+            f"{type(node).__name__} is not declared in "
+            f"{type(self).__name__}.list_fields — add it there to register "
+            f"it in this graph."
+        )
+
+    @classmethod
+    def from_nodes(cls, nodes: Iterable[Any]) -> "Graph":
+        ## @brief Construct a new instance of this Graph from an iterable of nodes.
+        ##
+        ## Creates an empty instance and calls ``add()`` for each node.
+        ## Routing is determined by ``list_fields`` — each node is placed in
+        ## the collection whose declared type it matches.  Nodes whose type
+        ## is not declared in ``list_fields`` raise ``TypeError`` via ``add()``.
+        ##
+        ## Typical use is to materialise the result of a set operation back
+        ## into a typed graph::
+        ##
+        ##     result = FilmGraph.from_nodes(
+        ##         intersect(query(graph_a).nodes(Film),
+        ##                   query(graph_b).nodes(Film))
+        ##     )
+        ##
+        ## @param nodes  Any iterable of ``Node`` instances.
+        ## @return A new instance of this Graph subclass.
+
+        instance = cls()
+        for node in nodes:
+            instance.add(node)
+        return instance
+
+    @classmethod
+    def _preregister(
+        cls,
+        snapshot: Dict[str, Any],
+        _registry: Dict[str, Any],
+    ) -> None:
+        ## @brief Pass 1 of two-pass deserialise: create and register all nodes.
+        ##
+        ## Walks every ``list_fields`` collection in *snapshot* and, for each
+        ## item dict that carries a ``_key``, creates a skeleton instance via
+        ## ``from_payload()`` (no ``_restore_children`` call yet) and registers
+        ## it in *_registry* under the item's own ``_key``.
+        ##
+        ## Nested ``Graph`` items are recursed into so that their own node
+        ## collections are also pre-registered before any ``$ref`` is resolved.
+        ##
+        ## @param snapshot   Plain snapshot dict from ``serialise(deep=True)``.
+        ## @param _registry  Running key→node registry populated in-place.
+
+        for field, (_, item_cls) in cls.list_fields.items():
+            for item_data in snapshot.get(field, []):
+                if not isinstance(item_data, dict) or "$ref" in item_data:
+                    continue
+                node_key = item_data.get("_key")
+                if node_key is not None:
+                    node = item_cls.from_payload(item_data)
+                    _registry[node_key] = node
+                if issubclass(item_cls, Graph):
+                    item_cls._preregister(item_data, _registry)
+
+    @classmethod
+    def deserialise(
+        cls,
+        snapshot: Any,
+        _registry: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        ## @brief Two-pass restore: pre-populate registry then resolve all refs.
+        ##
+        ## When *_registry* is ``None`` (the outermost call) a pre-pass
+        ## walks every typed list in *snapshot* and registers skeleton nodes
+        ## before any cross-reference is resolved.  This allows ``$ref``
+        ## links to point forwards or across node types without requiring a
+        ## specific serialisation order.
+        ##
+        ## @param snapshot   Plain dict from ``serialise(deep=True)``.
+        ## @param _registry  Shared key→node registry; callers omit.
+        ## @return A fully reconstructed ``Graph`` instance.
+
+        if not isinstance(snapshot, dict):
+            return super().deserialise(snapshot, _registry=_registry)
+
+        if _registry is None:
+            _registry = {}
+            cls._preregister(snapshot, _registry)
+
+        return super().deserialise(snapshot, _registry=_registry)
+
+
+# ============================================================================
+# Transaction
+# ============================================================================
+
+
+class Transaction:
     ## @brief Ordered multi-node lock acquisition.
     ##
     ## Acquires one or more ``Node`` or ``NodeList`` locks in a stable
@@ -1621,18 +1712,18 @@ class NodeTransaction:
     ## property returning a ``threading.RLock`` is accepted.
     ## Locks are released in reverse order.
     ##
-    ## ``ReadWriteMixin`` nodes are fully supported: ``_write_guard``
+    ## ``WriteMutex`` nodes are fully supported: ``_write_guard``
     ## is entered before ``_lock`` for each node (matching the documented
     ## lock ordering), so concurrent ``reading()`` contexts are blocked
     ## for the duration of the transaction.
     ##
     ## Usage::
     ##
-    ##     with NodeTransaction(node_a, node_b, node_c):
+    ##     with Transaction(node_a, node_b, node_c):
     ##         # safe: locks held in id order
     ##         node_a["ref"] = node_b["id"]
     ##
-    ##     with NodeTransaction(parent_node, some_nodelist):
+    ##     with Transaction(parent_node, some_nodelist):
     ##         for item in some_nodelist:   # safe: lock held
     ##             ...
 
@@ -1641,7 +1732,7 @@ class NodeTransaction:
         ##
         ## Nodes are sorted by ``id()`` for deterministic ordering.
         ## Any object with a ``.lock`` property is accepted
-        ## (``Node``, ``NodeList``, or ``ReadWriteMixin`` subclasses).
+        ## (``Node``, ``NodeList``, or ``WriteMutex`` subclasses).
         ##
         ## @param nodes  One or more lockable instances.
 
@@ -1655,13 +1746,13 @@ class NodeTransaction:
         self._nodes = sorted(unique, key=id)
         self._guards: List[Any] = []
 
-    def __enter__(self) -> NodeTransaction:
+    def __enter__(self) -> Transaction:
         ## @brief Acquire all write guards and locks in sorted order.
         ##
         ## For each node, ``_write_guard`` is entered before ``_lock``
         ## to maintain the correct lock ordering.  For plain ``Node``
         ## and ``NodeList`` instances ``_write_guard`` is a no-op.
-        ## For ``ReadWriteMixin`` nodes it acquires the write side of
+        ## For ``WriteMutex`` nodes it acquires the write side of
         ## the readers-writer lock, blocking any concurrent readers.
         ##
         ## If any acquisition raises, all previously-acquired guards
@@ -1703,11 +1794,11 @@ class NodeTransaction:
 
 
 # ============================================================================
-# ReadWriteMixin
+# WriteMutex
 # ============================================================================
 
 
-class ReadWriteMixin:
+class WriteMutex:
     ## @brief Opt-in mixin that adds readers-writer lock semantics to a
     ##        ``Node`` or ``NodeList``.
     ##
@@ -1720,7 +1811,7 @@ class ReadWriteMixin:
     ##
     ## Usage::
     ##
-    ##     class LiveList(ReadWriteMixin, NodeList[MyNode]):
+    ##     class LiveList(WriteMutex, NodeList[MyNode]):
     ##         pass
     ##
     ##     lst = LiveList()
@@ -1807,10 +1898,10 @@ class ReadWriteMixin:
 __all__ = [
     "Node",
     "NodeList",
-    "StreamMixin",
-    "GraphMixin",
+    "Stream",
+    "Graph",
     "Serialisable",
-    "SerialisableNodeList",
-    "NodeTransaction",
-    "ReadWriteMixin",
+    "SerialisableList",
+    "Transaction",
+    "WriteMutex",
 ]

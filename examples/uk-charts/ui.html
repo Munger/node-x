@@ -1,20 +1,25 @@
 <!DOCTYPE html>
 <!--
-  UK Charts Explorer — ui.html
+@file ui.html
 
-  D3 v7 force-graph that visualises official UK chart data streamed from
-  server.py.  The server owns the BFS queue; this page just renders what
-  arrives on the SSE stream and issues POST /explore/<id> when the user
-  clicks a node.
+@brief D3 v7 force-graph front-end for the UK Charts Explorer.
 
-  Architecture
-  ────────────
-  • GET /root          → reset server graph, receive root node JSON
-  • POST /explore/<id> → push a node onto the server BFS queue
-  • GET /stream        → EventSource; receives expand/status/done events
-  • POST /pause|resume → suspend / continue server workers
-  • POST /stop         → drain server queue without resetting graph
-  • GET /stats/<id>    → on-hover chart stats fetch (tooltip only)
+The server owns the BFS queue and streams nodes via SSE; this page
+renders what arrives and issues POST /explore/<id> when the user
+clicks a node.
+
+Endpoints used
+──────────────
+GET  /root          — reset server graph; root node arrives via SSE
+GET  /stream        — EventSource: node / expanded / status / done / heartbeat
+POST /explore/<id>  — push a node onto the server BFS queue
+POST /pause         — suspend workers
+POST /resume        — resume workers
+POST /stop          — drain queue without resetting graph
+GET  /stats/<id>    — lazy-fetch chart stats for a release (tooltip)
+
+@copyright Copyright (c) 2026 Tim Hosking
+@par Licence: MIT
 -->
 <html lang="en">
 <head>
@@ -39,7 +44,8 @@
   </div>
   <button id="pause-btn" class="tb-btn" onclick="togglePause()">Pause</button>
   <button id="stop-btn"  class="tb-btn" onclick="stopCascade()">Stop</button>
-  <button id="reset-btn" class="tb-btn" onclick="resetGraph()">Reset</button>
+  <button id="reset-btn"   class="tb-btn" onclick="resetGraph()">Reset</button>
+  <button id="restart-btn" class="tb-btn tb-danger" onclick="restartServer()">Restart Server</button>
   <span id="status-text">Initialising…</span>
 </div>
 
@@ -80,14 +86,10 @@
 <script>
 "use strict";
 
-// ── Colour palette ─────────────────────────────────────────────────────────
+// ── Colour and radius ──────────────────────────────────────────────────────
 //
-// Temporal spine uses a warm spectrum stepping down in luminosity each level.
-// Artist/release nodes use a green spectrum; artists are more prominent.
-
-// Colour and radius are carried by each node as node_colour / node_radius (from
-// RenderMixin on the server).  Prefs.get("nodeColour") provides the user-override
-// layer; the node attribute is the class default and the fallback.
+// Carried by each node as rendering.node_colour / rendering.node_radius.
+// Prefs.get("nodeColour") provides a user-override layer.
 
 const colour = d => {
   if (typeof d === "string") return Prefs.get("nodeColour", d) || "#555";
@@ -123,76 +125,92 @@ svg.on("click", () => { tipEl.style.display = "none"; });
 // ── Simulation parameters ──────────────────────────────────────────────────
 
 // Global sim params read from Prefs once at startup; per-node physics comes
-// directly from node attributes sent by the server (PhysicsMixin defaults,
-// overridable via Prefs.get("nodePhysics", nodeType)).
+// directly from node attributes sent by the server.
 const SIM = Prefs.get("simulation");
-
-// The set of edge types that belong to the temporal spine (used by angle force).
-
-// Link widths by edge type — purely visual, not physics.
-const LINK_WIDTH = {
-  "timeline-decade": 2.0, "decade-year": 1.8, "year-month": 1.5,
-  "month-week": 1.2, "week-release": 0.6,
-  "release-artist": 1.0, "artist-release": 1.0, "artist-artist": 0.7,
-};
 
 function linkStyle(sel) {
   sel
     .attr("stroke", d => {
       const key = `${d.source.node_type}-${d.target.node_type}`;
-      // Prefs.get returns the full linkColour section; look up by key.
       return Prefs.get("linkColour", key) || "#333";
     })
-    .attr("stroke-width", d => LINK_WIDTH[`${d.source.node_type}-${d.target.node_type}`] ?? 0.8);
+    .attr("stroke-width", d => d.target.physics.link_width);
 }
 
-// ── Temporal angle force ───────────────────────────────────────────────────
+// ── Angular spring force ────────────────────────────────────────────────────
 //
-// Returns the ideal spawn angle for a temporal child relative to its parent.
-// Decade: spread across 360° by decade number; year/month/week similarly.
-function _temporalAngle(child) {
-  if (child.node_type === "decade" && child.decade != null) {
-    const total = Math.ceil((2030 - 1950) / 10);
-    return ((child.decade - 1950) / 10) / total * 2 * Math.PI - Math.PI / 2;
+// angle_spring on the PARENT drives how strictly its children are distributed
+// evenly around it.  Strict (>= 5): position is snapped in tick() after D3's
+// own integration, so the constraint is never undone.  Soft (< 5): spring
+// force applied during the force step.
+// radial_spring on the CHILD resists being pulled away from target_radius.
+//
+// _asfNodes / _nodeById / _siblingAngles are module-level so tick() can
+// apply the strict spoke constraint after D3 finishes updating positions.
+
+let _asfNodes = [];
+const _nodeById     = new Map();
+const _siblingAngles = new Map();
+
+function _rebuildAngles() {
+  const childrenOf = new Map();
+  for (const n of _asfNodes) {
+    if (n.parent_id == null) continue;
+    if (!childrenOf.has(n.parent_id)) childrenOf.set(n.parent_id, []);
+    childrenOf.get(n.parent_id).push(n.id);
   }
-  if (child.node_type === "year"  && child.year  != null)
-    return (child.year % 10) / 10 * 2 * Math.PI - Math.PI / 2;
-  if (child.node_type === "month" && child.month != null)
-    return (child.month - 1) / 12 * 2 * Math.PI - Math.PI / 2;
-  if (child.node_type === "week"  && child.date)
-    return (parseInt(child.date.split("-")[2]) - 1) / 35 * 2 * Math.PI - Math.PI / 2;
-  return null;
+  _siblingAngles.clear();
+  for (const [, ids] of childrenOf) {
+    const sorted = [...ids].sort((a, b) =>
+      (_nodeById.get(a)?.sort_index ?? 0) - (_nodeById.get(b)?.sort_index ?? 0)
+    );
+    const total = sorted.length;
+    sorted.forEach((id, i) =>
+      _siblingAngles.set(id, (i / total) * 2 * Math.PI - Math.PI / 2)
+    );
+  }
 }
 
-// Custom force: angular spring that pulls each temporal node toward its home
-// angle relative to its temporal parent, while allowing radial movement.
-function temporalAngleForce(strength, radialStrength) {
-  let nodes, nodeById = new Map();
+function angularSpringForce() {
   function force(alpha) {
-    for (const n of nodes) {
-      if (n._homeAngle === undefined || n._temporalParentId === undefined) continue;
-      const parent = nodeById.get(n._temporalParentId);
+    for (const n of _asfNodes) {
+      const parent = n.parent_id != null ? _nodeById.get(n.parent_id) : null;
       if (!parent) continue;
       const dx = n.x - parent.x, dy = n.y - parent.y;
       const r  = Math.sqrt(dx * dx + dy * dy);
       if (r < 1) continue;
-      const θCur = Math.atan2(dy, dx);
-      // Angular spring
-      let dθ = n._homeAngle - θCur;
-      while (dθ >  Math.PI) dθ -= 2 * Math.PI;
-      while (dθ < -Math.PI) dθ += 2 * Math.PI;
-      const af = dθ * strength * alpha;
-      n.vx += -Math.sin(θCur) * af;
-      n.vy +=  Math.cos(θCur) * af;
-      // Radial spring — gentle resistance to being dragged inward by children
-      if (n._targetRadius !== undefined) {
-        const rf = (r - n._targetRadius) * radialStrength * alpha;
+
+      // Soft angular spring only — strict is handled in tick() post-integration.
+      const aStr = parent.physics?.angle_spring ?? 0;
+      if (aStr > 0 && aStr < 5) {
+        const homeAngle = _siblingAngles.get(n.id);
+        if (homeAngle != null) {
+          const θ = Math.atan2(dy, dx);
+          let dθ = homeAngle - θ;
+          while (dθ >  Math.PI) dθ -= 2 * Math.PI;
+          while (dθ < -Math.PI) dθ += 2 * Math.PI;
+          const af = dθ * aStr * alpha;
+          n.vx += -Math.sin(θ) * af;
+          n.vy +=  Math.cos(θ) * af;
+        }
+      }
+
+      const rStr = n.physics?.radial_spring ?? 0;
+      if (rStr) {
+        const rf = (r - (n.physics.target_radius ?? 100)) * rStr * alpha;
         n.vx -= (dx / r) * rf;
         n.vy -= (dy / r) * rf;
       }
     }
   }
-  force.initialize = ns => { nodes = ns; nodeById = new Map(ns.map(n => [n.id, n])); };
+
+  force.initialize = ns => {
+    _asfNodes = ns;
+    _nodeById.clear();
+    for (const n of ns) _nodeById.set(n.id, n);
+    _rebuildAngles();
+  };
+  force.update = () => _rebuildAngles();
   return force;
 }
 
@@ -200,44 +218,16 @@ function temporalAngleForce(strength, radialStrength) {
 
 const sim = d3.forceSimulation()
   .force("link", d3.forceLink().id(d => d.id)
-    // Distance comes from the target node's target_radius (PhysicsMixin).
-    .distance(d => d.target.physics.target_radius ?? 80)
-    .strength(d => {
-      const k   = `${d.source.node_type}-${d.target.node_type}`;
-      const tgt = d.target;
-      // Spine links use the target node's link_strength directly.
-      // Release–artist strength uses the best peak across all runs.
-      if (k === "artist-release" || k === "release-artist") {
-        const rel  = d.source.node_type === "release" ? d.source : d.target;
-        const base = rel.physics.link_strength ?? 0.55;
-        const runs = rel.runs || [];
-        if (!runs.length) return base;
-        const peak = Math.min(...runs.map(r => r.peak_position));
-        return Math.min(base * 1.55, Math.max(0.05, (101 - peak) / 150));
-      }
-      // Week–release strength: find the matching run and use its mean position.
-      if (k === "week-release") {
-        const chart = d.source.node_type === "chart" ? d.source : d.target;
-        const rel   = d.source.node_type === "release" ? d.source : d.target;
-        const runs  = rel.runs || [];
-        const key   = `${chart.chart_slug}/${chart.date}`;
-        const run   = runs.find(r => `${r.chart_slug}/${r.date}` === key);
-        const mean  = run ? run.mean_position : 50;
-        const cap   = rel.physics.link_strength ?? 0.45;
-        return Math.min((101 - mean) / 150, cap);
-      }
-      // All other link types use the target node's base link_strength.
-      return tgt.physics.link_strength ?? 0.4;
-    })
+    .distance(d => d.target.physics.target_radius)
+    .strength(d => d.target.physics.link_strength)
   )
   .force("charge",  d3.forceManyBody()
-    // charge comes from the node's PhysicsMixin attribute.
-    .strength(d => d.physics.charge ?? -30)
+    .strength(d => d.physics.charge)
     .distanceMax(SIM.chargeDistMax)
   )
-  .force("collide", d3.forceCollide().radius(d => radius(d) + (d.physics.collide_pad ?? SIM.collidePad ?? 3)))
-  .force("center",  d3.forceCenter(0, 0).strength(SIM.centerStrength))
-  .force("temporal-angle", temporalAngleForce(SIM.angleStrength, SIM.radialStrength))
+  .force("collide",  d3.forceCollide().radius(d => radius(d) + d.physics.collide_pad))
+  .force("center",   d3.forceCenter(0, 0).strength(SIM.centerStrength))
+  .force("angular",  angularSpringForce())
   .alphaDecay(SIM.alphaDecay)
   .velocityDecay(SIM.velocityDecay)
   .on("tick", tick);
@@ -252,7 +242,6 @@ const linkSet  = new Set();   // "srcId~tgtId" keys — prevents duplicate edges
 
 // ── Node rendering ─────────────────────────────────────────────────────────
 
-// label_lines comes from RenderMixin — nodes declare their own line splits.
 function applyLabel(sel) {
   sel.each(function(d) {
     const t     = d3.select(this).text(null);
@@ -280,20 +269,13 @@ function _attachHandlers(sel) {
       .on("drag",  function(e, d) { this._dragged = true; d.fx = e.x; d.fy = e.y; })
       .on("end",   function(e, d) {
         if (!e.active) sim.alphaTarget(0);
-        if (d.node_type !== "timeline") { d.fx = null; d.fy = null; }
+        d.fx = null; d.fy = null;
       })
     )
     .on("click", function(e, d) {
       e.stopPropagation();
       if (this._dragged) return;
-
-      const nextCount = (d._clickCount || 0) + 1;
-      const frontier = nextCount === 1
-        ? [d.id]
-        : _bfsToDepth(d.id, nextCount - 1);
-      if (frontier.length === 0) return;  // graph not ready yet — wait and click again
-      d._clickCount = nextCount;
-      for (const id of frontier) _postExplore(id);
+      _postExplore(d.id);
     })
     .on("mousemove",  (e, d) => showTip(e, d))
     .on("mouseleave", ()     => { tipEl.style.display = "none"; _tipNode = null; });
@@ -326,6 +308,7 @@ function nudgePhysics() {
   if (++_nudgeCount % SIM.nudgeBatch === 0) {
     sim.nodes(gNodes);
     sim.force("link").links(gLinks);
+    sim.force("angular").update();
     sim.alpha(Math.max(sim.alpha(), SIM.nudgeAlpha)).restart();
   }
 }
@@ -360,37 +343,18 @@ function addChild(child, parentId) {
     const prev   = posCache[child.id];    // reuse last known position if available
     let nd;
 
-    const angle  = _temporalAngle(child);
-    const spread = child.physics.child_spread ?? SIM.defaultSpread ?? 80;
+    const spread = child.physics.child_spread;
     if (prev) {
       nd = { ...child, x: prev.x, y: prev.y, vx: 0, vy: 0 };
-    } else if (parent && angle !== null) {
-      // Temporal children: spawn at their home angle at target_radius from parent.
-      const r = child.physics.target_radius ?? 100;
-      nd = { ...child,
-        x: parent.x + r * Math.cos(angle),
-        y: parent.y + r * Math.sin(angle),
-        vx: 0, vy: 0,
-      };
+    } else if (parent) {
+      const θ = Math.random() * 2 * Math.PI;
+      const r = spread * (0.5 + 0.5 * Math.random());
+      nd = { ...child, x: parent.x + r * Math.cos(θ), y: parent.y + r * Math.sin(θ), vx: 0, vy: 0 };
     } else {
-      // Chart nodes: scatter around parent using child_spread from PhysicsMixin.
-      // Use a random direction + guaranteed minimum distance (half of spread) so
-      // the child never spawns on top of the parent node.
-      if (parent) {
-        const θ = Math.random() * 2 * Math.PI;
-        const r = spread * (0.5 + 0.5 * Math.random());
-        nd = { ...child, x: parent.x + r * Math.cos(θ), y: parent.y + r * Math.sin(θ), vx: 0, vy: 0 };
-      } else {
-        nd = { ...child, x: (Math.random() - 0.5) * 600, y: (Math.random() - 0.5) * 600, vx: 0, vy: 0 };
-      }
+      nd = { ...child, x: (Math.random() - 0.5) * 600, y: (Math.random() - 0.5) * 600, vx: 0, vy: 0 };
     }
-
-    // Temporal angle spring needs a fixed parent reference and target distance.
-    if (angle !== null) {
-      nd._homeAngle      = angle;
-      nd._temporalParentId = parentId;
-      nd._targetRadius   = child.physics.target_radius ?? 100;
-    }
+    if (child.physics.fx != null) nd.fx = child.physics.fx;
+    if (child.physics.fy != null) nd.fy = child.physics.fy;
 
     gNodes.push(nd);
     liveAddNode(nd);
@@ -421,7 +385,17 @@ function _setupSSE() {
   _sse._ready = new Promise(res => _sse.addEventListener("open", res, { once: true }));
   _sse.addEventListener("node", e => {
     const data = JSON.parse(e.data);
-    addChild(data, data.parent_id);
+    if (!gNodes.find(n => n.id === data.id)) {
+      if (data.physics.fx != null) {
+        const nd = { ...data, x: data.physics.fx, y: data.physics.fy,
+                               fx: data.physics.fx, fy: data.physics.fy };
+        gNodes.push(nd);
+        svg.call(zoomBeh.transform, d3.zoomIdentity.translate(W() / 2, H() / 2).scale(1));
+        redraw();
+      } else {
+        addChild(data, data.parent_id);
+      }
+    }
     // nudgePhysics() inside addChild only fires every nudgeBatch nodes.
     // Always rebind here so small expansions (< nudgeBatch) still get physics.
     sim.nodes(gNodes);
@@ -465,7 +439,7 @@ _setupSSE();
 
 // ── Server API wrappers ─────────────────────────────────────────────────────
 
-// BFS from rootId in gLinks, returning node IDs at exactly `depth` hops.
+// Walk gLinks outward from rootId, returning node IDs at exactly `depth` hops.
 function _bfsToDepth(rootId, depth) {
   const visited = new Set([rootId]);
   let frontier = [rootId];
@@ -481,7 +455,7 @@ function _bfsToDepth(rootId, depth) {
         }
       }
     }
-    if (next.length === 0) return [];  // depth not yet reachable — don't fall back
+    if (next.length === 0) return [];
     frontier = next;
   }
   return frontier;
@@ -491,6 +465,11 @@ function _bfsToDepth(rootId, depth) {
 function _postExplore(nodeId) {
   const nd = gNodes.find(n => n.id === nodeId);
   if (nd) actLog(nd.rendering.label, "pending");
+  nodeG.selectAll("g.node").filter(d => d.id === nodeId)
+    .select("circle")
+    .attr("fill", "#fff")
+    .transition().duration(350).ease(d3.easeCubicOut)
+    .attr("fill", d => colour(d));
   fetch(`/explore/${nodeId}`, { method: "POST" }).catch(() => {});
 }
 
@@ -554,6 +533,23 @@ function redraw() {
 }
 
 function tick() {
+  // Strict spoke constraint — runs after D3 has already applied velocities to
+  // positions, so this correction sticks for both rendering and the next step.
+  for (const n of _asfNodes) {
+    const parent = n.parent_id != null ? _nodeById.get(n.parent_id) : null;
+    if (!parent || (parent.physics?.angle_spring ?? 0) < 5) continue;
+    const homeAngle = _siblingAngles.get(n.id);
+    if (homeAngle == null) continue;
+    const dx = n.x - parent.x, dy = n.y - parent.y;
+    const r  = Math.sqrt(dx * dx + dy * dy) || (n.physics?.target_radius ?? 100);
+    // Project velocity onto radial axis; zero the tangential component.
+    const vr = n.vx * (dx / r) + n.vy * (dy / r);
+    n.x  = parent.x + r * Math.cos(homeAngle);
+    n.y  = parent.y + r * Math.sin(homeAngle);
+    n.vx = vr * Math.cos(homeAngle);
+    n.vy = vr * Math.sin(homeAngle);
+  }
+
   // Save positions every tick so they survive a graph reset.
   gNodes.forEach(d => { posCache[d.id] = { x: d.x, y: d.y }; });
 
@@ -708,7 +704,7 @@ async function _addArtistItem(path, name) {
   const res  = await fetch(`/add-artist?path=${encodeURIComponent(path)}&name=${encodeURIComponent(name)}`);
   const data = await res.json();
   if (data.error || !data.node) return;
-  const root = gNodes.find(n => n.node_type === "timeline");
+  const root = gNodes.find(n => n.physics.fx != null);
   addChild(data.node, root ? root.id : gNodes[0]?.id);
   _postExplore(data.node.id);
 }
@@ -731,6 +727,22 @@ searchInput.addEventListener("keydown", async e => {
   searchInput.value = "";
   await Promise.all(items.map(item => _addArtistItem(item.dataset.path, item.dataset.name)));
 });
+
+async function restartServer() {
+  const btn = document.getElementById("restart-btn");
+  btn.disabled = true;
+  setStatus("Restarting server…");
+  try { await fetch("/restart", { method: "POST" }); } catch { /* process dies mid-response */ }
+  // Poll until the server is back, then do a full graph reset.
+  const poll = async () => {
+    try {
+      const r = await fetch("/root?chart=" + _chartMode, { signal: AbortSignal.timeout(1000) });
+      if (r.ok) { btn.disabled = false; await resetGraph(); return; }
+    } catch { /* still down */ }
+    setTimeout(poll, 500);
+  };
+  setTimeout(poll, 800);
+}
 
 // ── Boot ────────────────────────────────────────────────────────────────────
 
@@ -759,19 +771,9 @@ async function resetGraph() {
   await _sse._ready;   // ensure server has subscribed before /root triggers any BFS events
 
   try {
-    // Ask the server to reset its node graph and return the root node
-    const res  = await fetch(`/root?chart=${_chartMode}`);
-    const data = await res.json();
-    const root = data.node;
-
-    // Anchor the timeline root at the origin so the spine radiates outward
-    gNodes.push({ ...root, x: 0, y: 0, fx: 0, fy: 0 });
-    redraw();
-    svg.call(zoomBeh.transform, d3.zoomIdentity.translate(W() / 2, H() / 2).scale(1));
-
-    // If the server has already started expanding (auto_expand=True on root),
-    // the BFS is running — otherwise the user clicks the timeline node to begin.
-    setStatus(data.auto_expanding ? "Expanding…" : "Click the timeline node to begin.");
+    await fetch(`/root?chart=${_chartMode}`);
+    // The root node arrives via SSE and is placed by the "node" event handler.
+    setStatus("Loading…");
   } catch {
     setStatus("Server error — is server.py running?");
   }

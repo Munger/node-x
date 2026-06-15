@@ -75,6 +75,10 @@ body {
 #reset-btn          { background: #263238; color: #aaa; }
 #reset-btn:hover    { background: #37474f; }
 
+#restart-btn        { background: #4a1500; color: #ff8a65; }
+#restart-btn:hover  { background: #6d2000; }
+#restart-btn:disabled { opacity: .4; cursor: default; }
+
 /* ── Artist search ────────────────────────────────────────────────────────── */
 
 #search-wrap { position: relative; }

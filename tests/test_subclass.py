@@ -22,9 +22,9 @@
 ##     single ``Node``.
 ##   - **_walk_child_nodes** — verifies the ``func`` and ``list_func``
 ##     callbacks are invoked correctly.
-##   - **StreamMixin** — base class yields nothing; override yields
+##   - **Stream** — base class yields nothing; override yields
 ##     dynamic children.
-##   - **NodeTransaction with subclasses** — subclass instances are
+##   - **Transaction with subclasses** — subclass instances are
 ##     accepted without modification.
 ##   - **Node-typed _children** — single Node child (not in a NodeList)
 ##     must be descended into by ``_tree_iter``.
@@ -45,7 +45,7 @@ for _d in (_PKG_DIR, _ROOT_DIR):
     if _d not in sys.path:
         sys.path.insert(0, _d)
 
-from node_x import Node, NodeList, NodeTransaction, StreamMixin
+from node_x import Node, NodeList, Transaction, Stream
 
 from _helpers import (
     check,
@@ -211,13 +211,13 @@ def run() -> Tuple[int, int]:
           "annotated field count added to _reserved")
 
     # ------------------------------------------------------------------
-    heading("Subclass: StreamMixin override")
+    heading("Subclass: Stream override")
     # ------------------------------------------------------------------
-    # The base StreamMixin.stream() is a no-op generator; subclasses
+    # The base Stream.stream() is a no-op generator; subclasses
     # override it to yield dynamic children discovered from content.
     # Both the base and override behaviour are verified here.
 
-    class StreamNode(StreamMixin, Node):
+    class StreamNode(Stream, Node):
         def stream(self, data=None):
             yield Node({"child": 1})
             yield Node({"child": 2})
@@ -225,25 +225,25 @@ def run() -> Tuple[int, int]:
     sn = StreamNode({"parent": True})
     children = list(sn.stream())
     check(passed, failed, len(children) == 2,
-          "StreamMixin stream() yields dynamic children")
+          "Stream stream() yields dynamic children")
 
     # The unoverridden base must yield nothing at all.
-    base_stream = StreamMixin()
+    base_stream = Stream()
     check(passed, failed, list(base_stream.stream()) == [],
-          "StreamMixin base stream() yields nothing")
+          "Stream base stream() yields nothing")
 
     # ------------------------------------------------------------------
-    heading("Subclass: NodeTransaction with subclasses")
+    heading("Subclass: Transaction with subclasses")
     # ------------------------------------------------------------------
-    # NodeTransaction only requires that each argument exposes a .lock
+    # Transaction only requires that each argument exposes a .lock
     # property, so any Node subclass is accepted without adaptation.
 
     a = CustomNode({"x": 1})
     b = CustomNode({"y": 2})
-    with NodeTransaction(a, b):
+    with Transaction(a, b):
         a["x"] = a["x"] + b["y"]
     check(passed, failed, a["x"] == 3,
-          "NodeTransaction works with subclass instances")
+          "Transaction works with subclass instances")
 
     # ------------------------------------------------------------------
     heading("Subclass: _children with a single Node (not NodeList) child")
